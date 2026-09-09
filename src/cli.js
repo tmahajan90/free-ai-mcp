@@ -1544,11 +1544,29 @@ Return ONLY the file content inside a single code block. No explanations before 
   }
 }
 
-async function doAsk(question, fileContext, imageParts) {
+async function doAsk(question, fileContext, imageParts, contextFilePath) {
   const projectTree = scanDir(".", "", 2);
   const treeSnippet = projectTree.length > 0
     ? projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n")
     : "";
+
+  // Detect if this looks like an edit request
+  const editKeywords = /\b(add|remove|delete|change|replace|update|fix|rename|refactor|move|insert|modify|make|set|convert|wrap|unwrap|extract|inline|create|write|implement|put|drop|strip)\b/i;
+  const looksLikeEdit = editKeywords.test(question);
+
+  // Try to find a file path in the question if not already provided
+  let targetFile = contextFilePath || null;
+  if (!targetFile) {
+    const detectedPath = findPath(question);
+    if (detectedPath && isFile(detectedPath)) targetFile = detectedPath;
+  }
+
+  // If it looks like an edit and we have a file, read the file content
+  if (looksLikeEdit && targetFile && !fileContext) {
+    try {
+      fileContext = readFileSync(resolve(expandPath(targetFile)), "utf-8");
+    } catch {}
+  }
 
   let fullContext = "";
   if (projectMemory) fullContext += `Project context:\n${projectMemory}\n\n`;
@@ -1557,24 +1575,54 @@ async function doAsk(question, fileContext, imageParts) {
   if (treeSnippet) fullContext += `Project structure:\n${treeSnippet}\n\n`;
   const recent = getRecentContext();
   if (recent) fullContext += `${recent}\n\n`;
-  if (fileContext) fullContext += `File content:\n\`\`\`\n${fileContext}\n\`\`\`\n\n`;
+
+  // If edit intent + file context, tell AI to use SEARCH/REPLACE blocks
+  let systemPrompt = null;
+  if (looksLikeEdit && fileContext && targetFile) {
+    const lang = getLang(targetFile);
+    fullContext += `FILE: ${targetFile} (${lang})\nCURRENT FILE CONTENT:\n\`\`\`${lang}\n${fileContext}\n\`\`\`\n\n`;
+    fullContext += `INSTRUCTION: ${question}\n\nIMPORTANT: You MUST respond with SEARCH/REPLACE blocks to make changes directly in the file. Format:\n\n<<<<<<< SEARCH\nexact lines from the original file\n=======\nreplacement lines (or empty to delete)\n>>>>>>> REPLACE\n\nRULES:\n1. SEARCH must contain EXACT text from the file (copy-paste, don't retype)\n2. Include enough context for unique matching\n3. To REMOVE code: leave REPLACE empty\n4. Multiple blocks allowed\n5. After blocks, write a one-line summary`;
+  } else if (fileContext) {
+    fullContext += `File content:\n\`\`\`\n${fileContext}\n\`\`\`\n\n`;
+  }
 
   const prompt = fullContext
-    ? `${fullContext}Question: ${question}`
+    ? `${fullContext}${looksLikeEdit && targetFile ? "" : "Question: "}${question}`
     : question;
 
   // Stream response
-  let providerInfo = "";
   const opts = {
     context: chatHistory,
     onToken: (token) => process.stdout.write(token),
   };
   if (imageParts) opts.imageParts = imageParts;
+  if (systemPrompt) opts.systemPrompt = systemPrompt;
 
   try {
     const result = await askAI(prompt, opts);
     console.log("\n");
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+
+    // Auto-apply SEARCH/REPLACE blocks if present in response
+    const blocks = parseSearchReplace(result.text);
+    if (blocks.length > 0 && targetFile) {
+      const code = readFileSync(resolve(expandPath(targetFile)), "utf-8");
+      const { result: newCode, applied, failed } = applySearchReplace(code, blocks);
+
+      if (applied.length > 0 && newCode !== code) {
+        saveUndo(targetFile, code);
+        writeFileSync(resolve(expandPath(targetFile)), newCode);
+        trackEdit(targetFile);
+        printColored(`  ✓ Applied ${applied.length} change(s) to ${targetFile}  (undo: /undo)\n`, "green");
+        if (failed.length > 0) {
+          printColored(`  ⚠ ${failed.length} change(s) could not be matched\n`, "yellow");
+        }
+        console.log();
+      } else if (applied.length === 0) {
+        printColored(`  ⚠ SEARCH/REPLACE blocks didn't match the file. Retrying with full-file mode...\n\n`, "yellow");
+        await doEditFullFile(targetFile, code, getLang(targetFile), question, "");
+      }
+    }
 
     addToHistory(question, result.text);
   } catch (err) {
@@ -1872,7 +1920,7 @@ async function startChat() {
         const tree = scanDir(foundPath, "", 2);
         fileContext = `Directory "${foundPath}" contents:\n` + tree.map(e => e.type === "dir" ? e.path + "/" : e.path).join("\n");
       }
-      await doAsk(input, fileContext);
+      await doAsk(input, fileContext, null, foundPath);
     }
 
     showPrompt();
