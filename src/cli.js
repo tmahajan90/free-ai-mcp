@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { askAI, getProviderStatus } from "./router.js";
+import { askAI, getProviderStatus, getUsageStats } from "./router.js";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "fs";
 import { resolve, join, extname, basename, dirname, relative } from "path";
 import { createInterface } from "readline";
+import { homedir } from "os";
 
 const { execSync } = await import("child_process");
 
@@ -55,6 +56,10 @@ Interactive mode — type naturally:
     git status                        Git commands run directly
     commit                            AI writes commit message, you confirm
 
+  Image (Gemini vision):
+    image screenshot.png              Describe a screenshot
+    image mockup.png build this UI    Ask AI to implement from a screenshot
+
   Ask questions:
     "what is the best way to add pagination in Rails?"
     "how does the auth flow work in this project?"
@@ -63,19 +68,27 @@ Interactive mode — type naturally:
     /scan      Scan project structure
     /ls [dir]  List files
     /grep      Search across files
-    /status    Show provider status
+    /status    Show provider status + usage stats
     /undo      Undo last file edit
     /diff      Show session changes & git diff
     /commit    Smart commit with AI message
     /help      Show help
-    /clear     Clear conversation
-    /exit      Exit chat
+    /clear     Clear conversation + history
+    /exit      Exit chat (history saved for next session)
 
-Project memory: Create .free-ai.md in your project root with instructions
-  like "This is a Rails 8 app using Tailwind v4" and the AI will use it.
+Features:
+  - Tab completion for file paths
+  - Streaming responses (tokens appear as AI generates them)
+  - Conversation resumes across sessions
+  - Auto-retry with next provider if AI gives bad response
+  - Usage tracking per provider (see /status)
+  - Image analysis via Gemini vision (free)
+
+Project memory: Create .free-ai.md in your project root with context
+  like "This is a Rails 8 app using Tailwind v4" and the AI always knows it.
 
 Edit engine uses SEARCH/REPLACE blocks (like Claude Code) for precise changes.
-Providers are tried in order. If one is rate-limited, the next is used.
+Providers are tried in order. If one gives a bad response, the next is tried.
 `;
 
 const LANG_MAP = {
@@ -363,6 +376,88 @@ function getRecentContext() {
     parts.push(`Recently read: ${[...sessionReads].slice(-5).join(", ")}`);
   }
   return parts.join("\n");
+}
+
+// --- Conversation persistence ---
+
+const HISTORY_FILE = join(process.cwd(), ".free-ai-history.json");
+
+function loadChatHistory() {
+  try {
+    if (existsSync(HISTORY_FILE) && !statSync(HISTORY_FILE).isDirectory()) {
+      const data = JSON.parse(readFileSync(HISTORY_FILE, "utf-8"));
+      if (Array.isArray(data)) return data.slice(-20);
+    }
+  } catch {}
+  return [];
+}
+
+function saveChatHistory(history) {
+  try {
+    writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-20), null, 2));
+  } catch {}
+}
+
+// --- Image support (Gemini vision) ---
+
+function loadImage(imagePath) {
+  const resolved = resolve(expandPath(imagePath));
+  if (!existsSync(resolved)) {
+    printColored(`Image not found: ${resolved}\n`, "red");
+    return null;
+  }
+
+  try {
+    const data = readFileSync(resolved);
+    const base64 = data.toString("base64");
+
+    const ext = extname(imagePath).toLowerCase();
+    const mimeMap = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+    const mimeType = mimeMap[ext] || "image/png";
+
+    return [{ inlineData: { mimeType, data: base64 } }];
+  } catch (err) {
+    printColored(`Cannot read image: ${err.message}\n`, "red");
+    return null;
+  }
+}
+
+// --- File path autocomplete ---
+
+function fileCompleter(line) {
+  // Get the last word being typed
+  const words = line.split(/\s+/);
+  const partial = words[words.length - 1] || "";
+
+  if (!partial || partial.startsWith("-")) return [[], line];
+
+  const expanded = expandPath(partial);
+  const dir = expanded.includes("/") ? dirname(expanded) : ".";
+  const prefix = expanded.includes("/") ? basename(expanded) : expanded;
+
+  try {
+    const resolved = resolve(dir);
+    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) return [[], line];
+
+    const items = readdirSync(resolved).filter(i => !i.startsWith(".") && !IGNORE_DIRS.has(i));
+    const matches = items
+      .filter(i => i.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(i => {
+        const full = join(dir, i);
+        const resolvedFull = resolve(full);
+        const isDir = existsSync(resolvedFull) && statSync(resolvedFull).isDirectory();
+        return isDir ? full + "/" : full;
+      });
+
+    if (matches.length === 0) return [[], line];
+
+    // Replace last word with matches
+    const lineWithoutLast = words.slice(0, -1).join(" ");
+    const completions = matches.map(m => lineWithoutLast ? `${lineWithoutLast} ${m}` : m);
+    return [completions, line];
+  } catch {
+    return [[], line];
+  }
 }
 
 // --- Shell command execution ---
@@ -959,7 +1054,44 @@ RULES:
         printColored("\n  ✗ Changes discarded.\n\n", "yellow");
       }
     } else {
-      // No search/replace blocks — try extracting a full file code block
+      // No search/replace blocks — check if we got a usable code block
+      const codeBlock = extractCodeBlock(result.text);
+      const hasCode = codeBlock !== result.text && codeBlock.trim().length > 10;
+
+      if (!hasCode && result.providerName) {
+        // Bad response — retry with next provider
+        printColored("  ⚠ AI didn't return usable edits. Retrying with next provider...\n\n", "yellow");
+        try {
+          const retry = await askAI(prompt, { skipProvider: result.providerName });
+          printColored(`[${retry.provider} — ${retry.model}]\n\n`, "cyan");
+          const retryBlocks = parseSearchReplace(retry.text);
+          if (retryBlocks.length > 0) {
+            const { result: newCode, applied } = applySearchReplace(code, retryBlocks);
+            if (applied.length > 0) {
+              printColored(`  File: ${filePath}\n`, "bold");
+              printColored(`  ${applied.length} change(s):\n\n`, "green");
+              for (const b of applied) {
+                if (b.search.trim()) b.search.split("\n").slice(0, 5).forEach(l => printColored(`  - ${l}\n`, "red"));
+                if (b.replace.trim()) b.replace.split("\n").slice(0, 5).forEach(l => printColored(`  + ${l}\n`, "green"));
+                else printColored(`  (removed)\n`, "red");
+                console.log();
+              }
+              const ok = await confirm("  Apply changes? (y/n) ");
+              if (ok) {
+                saveUndo(filePath, code);
+                writeFileSync(resolve(expandPath(filePath)), newCode);
+                trackEdit(filePath);
+                printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
+              } else {
+                printColored("\n  ✗ Changes discarded.\n\n", "yellow");
+              }
+              return;
+            }
+          }
+        } catch {}
+        // Still no luck — fall back to full-file mode
+      }
+
       await doEditFullFile(filePath, code, lang, instruction, treeContext);
     }
   } catch (err) {
@@ -1243,8 +1375,7 @@ Return ONLY the file content inside a single code block. No explanations before 
   }
 }
 
-async function doAsk(question, fileContext) {
-  // Include project structure in context for better answers
+async function doAsk(question, fileContext, imageParts) {
   const projectTree = scanDir(".", "", 2);
   const treeSnippet = projectTree.length > 0
     ? projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n")
@@ -1261,13 +1392,18 @@ async function doAsk(question, fileContext) {
     ? `${fullContext}Question: ${question}`
     : question;
 
-  printColored("⏳ Thinking...\n\n", "dim");
+  // Stream response
+  let providerInfo = "";
+  const opts = {
+    context: chatHistory,
+    onToken: (token) => process.stdout.write(token),
+  };
+  if (imageParts) opts.imageParts = imageParts;
 
   try {
-    const result = await askAI(prompt, { context: chatHistory });
+    const result = await askAI(prompt, opts);
+    console.log("\n");
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
-    console.log(result.text);
-    console.log();
 
     chatHistory.push({ role: "user", content: question });
     chatHistory.push({ role: "assistant", content: result.text });
@@ -1275,13 +1411,14 @@ async function doAsk(question, fileContext) {
     if (chatHistory.length > 20) {
       chatHistory = chatHistory.slice(-14);
     }
+    saveChatHistory(chatHistory);
   } catch (err) {
-    printColored(`Error: ${err.message}\n`, "red");
+    printColored(`\nError: ${err.message}\n`, "red");
   }
 }
 
 // --- Conversation history ---
-let chatHistory = [];
+let chatHistory = loadChatHistory();
 
 // --- Undo stack ---
 let undoStack = [];
@@ -1331,10 +1468,14 @@ async function startChat() {
   if (projectMemory) {
     printColored(`  Memory: .free-ai.md loaded\n`, "green");
   }
+  if (chatHistory.length > 0) {
+    printColored(`  History: ${chatHistory.length / 2} previous messages restored\n`, "cyan");
+  }
 
   console.log();
   printColored("  Type naturally — edit, review, search, fix, commit.\n", "dim");
   printColored("  Shell: !<cmd>  Git: git status  Search: grep <text>  Tests: fix\n", "dim");
+  printColored("  Image: image <path>  Tab: autocomplete file paths\n", "dim");
   printColored("  /help for all commands  |  /exit to quit\n", "dim");
   console.log();
 
@@ -1342,6 +1483,7 @@ async function startChat() {
     input: process.stdin,
     output: process.stdout,
     prompt: "",
+    completer: fileCompleter,
   });
 
   function showPrompt() {
@@ -1361,6 +1503,7 @@ async function startChat() {
     // Exit commands (with or without slash)
     if (input === "/exit" || input === "/quit" || input === "/q" ||
         input === "exit" || input === "quit" || input === "q" || input === "bye") {
+      saveChatHistory(chatHistory);
       printColored("\n  Goodbye!\n\n", "cyan");
       process.exit(0);
     }
@@ -1376,6 +1519,7 @@ async function startChat() {
     }
     if (input === "/clear") {
       chatHistory = [];
+      saveChatHistory([]);
       printColored("  Conversation cleared.\n\n", "dim");
       showPrompt();
       return;
@@ -1444,6 +1588,20 @@ async function startChat() {
         doGrep(pattern, searchPath);
       } else {
         printColored('  Usage: grep <pattern> [path]\n\n', "yellow");
+      }
+      showPrompt();
+      return;
+    }
+
+    // Image command: "image <path> [question]" — send screenshot to AI (Gemini vision)
+    if (lowerInput.startsWith("image ") || lowerInput.startsWith("screenshot ")) {
+      const rest = input.replace(/^(?:image|screenshot)\s+/i, "").trim();
+      const imgPath = findPath(rest) || rest.split(/\s+/)[0];
+      const question = rest.replace(imgPath, "").trim() || "Describe this image. If it's a UI, explain what you see.";
+      const parts = loadImage(imgPath);
+      if (parts) {
+        printColored(`  Loaded image: ${imgPath}\n\n`, "dim");
+        await doAsk(question, null, parts);
       }
       showPrompt();
       return;
@@ -1617,14 +1775,26 @@ async function handleScan() {
 
 function handleStatus() {
   const status = getProviderStatus();
+  const usage = getUsageStats();
+
   console.log("\nFree AI Providers:\n");
   for (const p of status) {
     const icon = p.configured ? "✓" : "✗";
     const color = p.configured ? "green" : "red";
     printColored(`  ${icon} `, color);
     printColored(`${p.label}`, "bold");
-    printColored(` (${p.model})\n`, "dim");
+    printColored(` (${p.model})`, "dim");
+    if (p.supportsVision) printColored(` [vision]`, "magenta");
+    console.log();
     printColored(`    ${p.freeInfo}\n`, "dim");
+
+    const u = usage[p.name];
+    if (u) {
+      const ago = Math.round((Date.now() - u.lastUsed) / 60000);
+      printColored(`    Session: ${u.requests} request(s)`, "cyan");
+      if (ago > 0) printColored(` (last: ${ago}m ago)`, "dim");
+      console.log();
+    }
   }
   console.log();
 
@@ -1635,10 +1805,10 @@ function handleStatus() {
       "yellow"
     );
   } else {
-    printColored(
-      `  ${configured}/${status.length} providers active\n\n`,
-      "green"
-    );
+    const totalRequests = Object.values(usage).reduce((sum, u) => sum + u.requests, 0);
+    printColored(`  ${configured}/${status.length} providers active`, "green");
+    if (totalRequests > 0) printColored(` | ${totalRequests} total requests this session`, "dim");
+    console.log("\n");
   }
 }
 

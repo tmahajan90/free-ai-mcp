@@ -37,7 +37,23 @@ function getProviderStatus() {
     model: p.model,
     configured: !!process.env[p.envKey],
     freeInfo: p.freeInfo,
+    supportsVision: !!p.supportsVision,
   }));
+}
+
+// --- Usage tracking ---
+const usageStats = {};
+
+function trackUsage(providerName) {
+  if (!usageStats[providerName]) {
+    usageStats[providerName] = { requests: 0, firstUsed: Date.now(), lastUsed: Date.now() };
+  }
+  usageStats[providerName].requests++;
+  usageStats[providerName].lastUsed = Date.now();
+}
+
+function getUsageStats() {
+  return { ...usageStats };
 }
 
 const SYSTEM_PROMPT = `You are an expert coding assistant. Provide clear, concise, and accurate answers.
@@ -62,22 +78,40 @@ async function askAI(prompt, options = {}) {
   ];
 
   const errors = [];
+  const callOpts = {};
+  if (options.onToken) callOpts.onToken = options.onToken;
+  if (options.imageParts) callOpts.imageParts = options.imageParts;
 
-  for (const provider of active) {
+  // If image requested, prefer providers with vision support
+  let providerList = active;
+  if (options.imageParts) {
+    const visionProviders = active.filter(p => p.supportsVision);
+    const nonVision = active.filter(p => !p.supportsVision);
+    providerList = [...visionProviders, ...nonVision];
+  }
+
+  // If skipProvider specified (for retry), skip that one
+  if (options.skipProvider) {
+    providerList = providerList.filter(p => p.name !== options.skipProvider);
+  }
+
+  for (const provider of providerList) {
     try {
       const result = await provider.call(
         process.env[provider.envKey],
         messages,
-        options.model
+        options.model,
+        callOpts,
       );
+      trackUsage(provider.name);
       return {
         text: result,
         provider: provider.label,
+        providerName: provider.name,
         model: options.model || provider.model,
       };
     } catch (err) {
       errors.push({ provider: provider.label, error: err.message });
-      // Rate limited or quota exceeded — try next provider
       continue;
     }
   }
@@ -88,4 +122,4 @@ async function askAI(prompt, options = {}) {
   );
 }
 
-export { askAI, getProviderStatus, getActiveProviders };
+export { askAI, getProviderStatus, getActiveProviders, getUsageStats };

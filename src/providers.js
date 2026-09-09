@@ -1,3 +1,26 @@
+import { readFileSync } from "fs";
+
+// Parse SSE stream for OpenAI-compatible APIs
+async function parseOpenAIStream(resp, onToken) {
+  let full = "";
+  const decoder = new TextDecoder();
+  for await (const chunk of resp.body) {
+    const text = decoder.decode(chunk, { stream: true });
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      try {
+        const data = JSON.parse(line.slice(6));
+        const token = data.choices?.[0]?.delta?.content;
+        if (token) {
+          full += token;
+          if (onToken) onToken(token);
+        }
+      } catch {}
+    }
+  }
+  return full;
+}
+
 const PROVIDERS = [
   {
     name: "gemini",
@@ -6,21 +29,39 @@ const PROVIDERS = [
     model: "gemini-2.5-flash",
     endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
     freeInfo: "15 req/min, 1M tokens/day — https://aistudio.google.com/apikey",
+    supportsVision: true,
 
-    async call(apiKey, messages, model) {
+    async call(apiKey, messages, model, { onToken, imageParts } = {}) {
       const m = model || this.model;
-      const url = `${this.endpoint}/${m}:generateContent?key=${apiKey}`;
+      const stream = !!onToken;
+      const action = stream ? "streamGenerateContent?alt=sse" : "generateContent";
+      const url = `${this.endpoint}/${m}:${action}&key=${apiKey}`;
 
-      const contents = messages.map(msg => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content }],
-      }));
+      const contents = messages.map(msg => {
+        const parts = [{ text: msg.content }];
+        if (msg.role === "user" && imageParts) parts.push(...imageParts);
+        return {
+          role: msg.role === "assistant" ? "model" : "user",
+          parts,
+        };
+      });
+
+      // Only add image to the last user message
+      if (imageParts) {
+        const lastUser = contents.filter(c => c.role === "user").pop();
+        if (lastUser && !lastUser.parts.some(p => p.inlineData)) {
+          lastUser.parts.push(...imageParts);
+        }
+      }
 
       const resp = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents,
+          contents: contents.filter(c => {
+            if (imageParts) return true;
+            return true;
+          }),
           generationConfig: { maxOutputTokens: 8192 },
         }),
       });
@@ -28,6 +69,26 @@ const PROVIDERS = [
       if (!resp.ok) {
         const err = await resp.text();
         throw new Error(`Gemini ${resp.status}: ${err}`);
+      }
+
+      if (stream) {
+        let full = "";
+        const decoder = new TextDecoder();
+        for await (const chunk of resp.body) {
+          const text = decoder.decode(chunk, { stream: true });
+          for (const line of text.split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            try {
+              const data = JSON.parse(line.slice(6));
+              const token = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (token) {
+                full += token;
+                onToken(token);
+              }
+            } catch {}
+          }
+        }
+        return full;
       }
 
       const data = await resp.json();
@@ -43,7 +104,8 @@ const PROVIDERS = [
     endpoint: "https://api.groq.com/openai/v1/chat/completions",
     freeInfo: "30 req/min, 14,400 req/day — https://console.groq.com",
 
-    async call(apiKey, messages, model) {
+    async call(apiKey, messages, model, { onToken } = {}) {
+      const stream = !!onToken;
       const resp = await fetch(this.endpoint, {
         method: "POST",
         headers: {
@@ -54,6 +116,7 @@ const PROVIDERS = [
           model: model || this.model,
           messages,
           max_tokens: 8192,
+          stream,
         }),
       });
 
@@ -62,6 +125,7 @@ const PROVIDERS = [
         throw new Error(`Groq ${resp.status}: ${err}`);
       }
 
+      if (stream) return parseOpenAIStream(resp, onToken);
       const data = await resp.json();
       return data.choices?.[0]?.message?.content || "";
     },
@@ -75,7 +139,8 @@ const PROVIDERS = [
     endpoint: "https://api.mistral.ai/v1/chat/completions",
     freeInfo: "Free tier available — https://console.mistral.ai",
 
-    async call(apiKey, messages, model) {
+    async call(apiKey, messages, model, { onToken } = {}) {
+      const stream = !!onToken;
       const resp = await fetch(this.endpoint, {
         method: "POST",
         headers: {
@@ -86,6 +151,7 @@ const PROVIDERS = [
           model: model || this.model,
           messages,
           max_tokens: 8192,
+          stream,
         }),
       });
 
@@ -94,6 +160,7 @@ const PROVIDERS = [
         throw new Error(`Mistral ${resp.status}: ${err}`);
       }
 
+      if (stream) return parseOpenAIStream(resp, onToken);
       const data = await resp.json();
       return data.choices?.[0]?.message?.content || "";
     },
@@ -107,7 +174,8 @@ const PROVIDERS = [
     endpoint: "https://api.cerebras.ai/v1/chat/completions",
     freeInfo: "Free tier — https://cloud.cerebras.ai",
 
-    async call(apiKey, messages, model) {
+    async call(apiKey, messages, model, { onToken } = {}) {
+      const stream = !!onToken;
       const resp = await fetch(this.endpoint, {
         method: "POST",
         headers: {
@@ -118,6 +186,7 @@ const PROVIDERS = [
           model: model || this.model,
           messages,
           max_tokens: 8192,
+          stream,
         }),
       });
 
@@ -126,6 +195,7 @@ const PROVIDERS = [
         throw new Error(`Cerebras ${resp.status}: ${err}`);
       }
 
+      if (stream) return parseOpenAIStream(resp, onToken);
       const data = await resp.json();
       return data.choices?.[0]?.message?.content || "";
     },
@@ -139,7 +209,8 @@ const PROVIDERS = [
     endpoint: "https://openrouter.ai/api/v1/chat/completions",
     freeInfo: "Free models available — https://openrouter.ai",
 
-    async call(apiKey, messages, model) {
+    async call(apiKey, messages, model, { onToken } = {}) {
+      const stream = !!onToken;
       const resp = await fetch(this.endpoint, {
         method: "POST",
         headers: {
@@ -150,6 +221,7 @@ const PROVIDERS = [
           model: model || this.model,
           messages,
           max_tokens: 8192,
+          stream,
         }),
       });
 
@@ -158,6 +230,7 @@ const PROVIDERS = [
         throw new Error(`OpenRouter ${resp.status}: ${err}`);
       }
 
+      if (stream) return parseOpenAIStream(resp, onToken);
       const data = await resp.json();
       return data.choices?.[0]?.message?.content || "";
     },

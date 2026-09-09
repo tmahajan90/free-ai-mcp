@@ -6,22 +6,27 @@ Works as both a **CLI tool** (interactive terminal agent) and an **MCP server** 
 
 ## Features
 
-- **Search/Replace editing** — Precise SEARCH/REPLACE blocks (like Claude Code), not entire files
+- **Streaming responses** — Tokens appear as the AI generates them, no waiting
+- **Search/Replace editing** — Precise SEARCH/REPLACE blocks (like Claude Code)
 - **Auto-fix loop** — Runs tests, reads errors, fixes code automatically (up to 3 attempts)
 - **Multi-file edits** — "add a name column to users" plans and edits migration + model + views
 - **Project memory** — `.free-ai.md` gives the AI persistent context about your project
 - **Grep/search** — Search across your codebase without leaving the agent
 - **Smart commit** — AI writes commit messages, you just confirm
-- **Session tracking** — Remembers recently edited/read files for better context
+- **Image/screenshot support** — Send screenshots to Gemini vision, ask "build this UI"
+- **Tab completion** — Press Tab to autocomplete file paths
+- **Conversation persistence** — Chat history saved, resumes next session
+- **Auto-retry** — Bad AI response? Automatically retries with the next provider
+- **Usage tracking** — See request counts per provider with `/status`
 - **Shell & Git** — Run any command with `!` prefix, git commands work directly
 - **Undo** — Revert any edit instantly
-- **Auto-fallback** — 5 free AI providers, automatic fallback on rate limits
+- **Auto-fallback** — 5 free AI providers with automatic failover
 
 ## Supported Providers (All Free)
 
 | Provider | Model | Free Tier | Sign Up |
 |---|---|---|---|
-| Google Gemini | gemini-2.5-flash | 15 req/min, 1M tokens/day | https://aistudio.google.com/apikey |
+| Google Gemini | gemini-2.5-flash | 15 req/min, 1M tokens/day, **vision** | https://aistudio.google.com/apikey |
 | Groq | llama-3.3-70b | 30 req/min, 14,400 req/day | https://console.groq.com |
 | Mistral AI | mistral-small | Free tier | https://console.mistral.ai |
 | Cerebras | qwen-3.8-27b | Free tier | https://cloud.cerebras.ai |
@@ -42,7 +47,7 @@ npm install
 Sign up at any of the provider links above. You need **at least one**, but more = more fallback.
 
 Recommended:
-- **Google Gemini** — best free tier (1M tokens/day)
+- **Google Gemini** — best free tier (1M tokens/day) + image support
 - **Groq** — fastest responses (<1 second)
 
 ### 3. Configure API keys
@@ -89,16 +94,13 @@ remove the header from app/views/layouts/application.html.erb
 ```
 add a name column to users
 add a search feature to products
-generate a CRUD for invoices
 ```
-The AI plans which files to create/edit, then executes each step.
 
-### Auto-fix (run tests → fix errors → repeat)
+### Auto-fix (run tests -> fix errors -> repeat)
 ```
 fix                              Auto-detects test command
 fix bundle exec rails test       Custom test command
 fix npm test                     Works with any runner
-fix pytest                       Python too
 ```
 
 ### Search across files
@@ -106,6 +108,12 @@ fix pytest                       Python too
 grep validates app/models        Find text in files
 search "def create"              Same as grep
 find TODO                        Find all TODOs
+```
+
+### Image / Screenshot (Gemini vision)
+```
+image screenshot.png             Describe what's in the image
+image mockup.png build this UI   AI analyzes image and generates code
 ```
 
 ### Read & explore
@@ -117,40 +125,33 @@ ls app/models
 scan app/controllers
 ```
 
-### Create files
-```
-create app/services/stock_alert.rb service that checks low stock
-```
-
 ### Shell & Git
 ```
 !bundle exec rails test          Run any shell command
-run npm install                   Same as ! prefix
 git status                        Git commands directly
-git diff                          View changes
 commit                            AI writes commit message
-```
-
-### Ask questions
-```
-what is the best way to add pagination in Rails?
-how does the auth flow work in this project?
 ```
 
 ### All commands
 | Command | Description |
 |---|---|
 | `grep <pattern> [path]` | Search across files |
-| `fix [test cmd]` | Auto-fix: run tests → fix errors → repeat |
+| `fix [test cmd]` | Auto-fix: run tests, fix errors, repeat |
 | `commit` | Smart commit with AI-generated message |
 | `diff [file]` | Show session changes / git diff |
+| `image <path> [question]` | Analyze image with Gemini vision |
 | `/undo` | Undo last file edit |
 | `/scan` | Scan project structure |
 | `/ls [dir]` | List files |
-| `/status` | Show provider status |
+| `/status` | Show providers + usage stats |
 | `/help` | Show help |
-| `/clear` | Clear conversation history |
-| `/exit` | Exit chat |
+| `/clear` | Clear conversation + saved history |
+| `/exit` | Exit (history saved for next session) |
+
+### Keyboard shortcuts
+- **Tab** — Autocomplete file paths
+- **Up/Down** — Navigate input history
+- **Ctrl+C** — Cancel current operation
 
 ## Usage — One-shot CLI
 
@@ -192,37 +193,20 @@ replacement lines (or empty to delete)
 >>>>>>> REPLACE
 ```
 
-Why this is better than full-file replacement:
-- AI only outputs changed parts — no truncation risk on large files
-- Deletions work reliably (empty REPLACE = remove)
-- Multiple precise changes in one pass
-- Falls back to full-file mode automatically if needed
-
-## How auto-fix works
-
-```
-You type: fix
-       |
-       v
-  [Run tests] → Tests pass? Done!
-       |
-       v (tests fail)
-  [Send errors to AI] → AI returns SEARCH/REPLACE fixes
-       |
-       v
-  [Apply fixes with confirmation]
-       |
-       v
-  [Run tests again] → Up to 3 attempts
-```
+**Retry chain:**
+1. Ask AI for SEARCH/REPLACE blocks
+2. If blocks don't match the file -> retry full-file mode
+3. If AI gives garbage response -> auto-retry with next provider
+4. Falls back to full-file replacement as last resort
 
 ## Tips
 
 - Add all 5 provider keys to maximize free usage across the day
-- Gemini has the most generous free tier (1M tokens/day)
+- Gemini has the most generous free tier (1M tokens/day) and supports images
 - Groq is the fastest (responses in <1 second)
 - Create `.free-ai.md` for project-specific context the AI always knows
 - Use `fix` after making changes to auto-run and fix tests
 - Use `commit` for AI-generated commit messages
-- Use `grep` to find code before editing
-- The agent remembers your recent reads/edits for better context
+- Tab-complete file paths to type faster
+- Conversation persists across sessions — no need to re-explain context
+- `/status` shows how many requests you've made per provider
