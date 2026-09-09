@@ -34,8 +34,8 @@ const PROVIDERS = [
     async call(apiKey, messages, model, { onToken, imageParts } = {}) {
       const m = model || this.model;
       const stream = !!onToken;
-      const action = stream ? "streamGenerateContent?alt=sse" : "generateContent";
-      const url = `${this.endpoint}/${m}:${action}&key=${apiKey}`;
+      const action = stream ? "streamGenerateContent?alt=sse&" : "generateContent?";
+      const url = `${this.endpoint}/${m}:${action}key=${apiKey}`;
 
       const contents = messages.map(msg => {
         const parts = [{ text: msg.content }];
