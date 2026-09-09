@@ -1,8 +1,17 @@
 # free-ai-mcp
 
-Chain multiple free AI APIs with automatic fallback. When one provider hits its rate limit, the next one takes over seamlessly.
+Free AI coding agent that can **read, edit, review, and generate code** — powered by multiple free AI APIs with automatic fallback. When one provider hits its rate limit, the next one takes over seamlessly.
 
 Works as both a **CLI tool** (use directly in terminal) and an **MCP server** (use inside Claude Code, Cursor, etc.).
+
+## Features
+
+- **Edit files** — AI reads your file, applies changes, shows diff, and saves
+- **Generate files** — Create new files from instructions
+- **Review code** — Get a code review for bugs, security, and best practices
+- **Explain code** — Understand any file in your project
+- **Ask questions** — Ask coding questions with optional file context
+- **Auto-fallback** — If one AI provider is rate-limited, the next one is tried automatically
 
 ## Supported Providers (All Free)
 
@@ -47,22 +56,38 @@ GROQ_API_KEY=your_groq_key_here
 
 ## Usage — CLI (Direct)
 
-### Ask a coding question
+### Edit a file with AI
 
 ```bash
-node src/cli.js ask "how to add pagination in Rails"
+node src/cli.js edit app/models/user.rb "add email validation"
+node src/cli.js edit src/index.js "add error handling to the fetch call"
 ```
 
-### Ask with file context
+The AI reads the file, applies your instruction, shows a diff, and asks for confirmation before saving.
+
+### Generate a new file
 
 ```bash
-node src/cli.js ask -f app/models/user.rb "optimize this model"
+node src/cli.js generate app/models/invoice.rb "Rails model with validations for invoice"
+```
+
+### Explain a file
+
+```bash
+node src/cli.js explain app/controllers/sales_controller.rb
 ```
 
 ### Review a code file
 
 ```bash
-node src/cli.js review app/controllers/sales_controller.rb
+node src/cli.js review app/views/sales/_form.html.erb
+```
+
+### Ask a coding question
+
+```bash
+node src/cli.js ask "how to add pagination in Rails"
+node src/cli.js ask -f app/models/user.rb "optimize this model"
 ```
 
 ### Check provider status
@@ -71,7 +96,7 @@ node src/cli.js review app/controllers/sales_controller.rb
 node src/cli.js status
 ```
 
-## Usage — MCP Server (Claude Code)
+## Usage — MCP Server (Claude Code / Cursor)
 
 ### Add to Claude Code
 
@@ -81,11 +106,17 @@ claude mcp add free-ai node /full/path/to/free-ai-mcp/src/mcp-server.js
 
 ### Available MCP tools
 
-Once added, Claude Code gets these tools:
+Once added, you get these tools:
 
-- **ask_ai** — Ask a coding question to free AI models
-- **review_code** — Get a code review from a free AI model
-- **ai_status** — Check which providers are configured and available
+| Tool | Description |
+|---|---|
+| **edit_code** | Read a file, edit it with AI, and save changes |
+| **read_code** | Read a file with line numbers |
+| **generate_code** | Generate a new file from instructions |
+| **explain_code** | Get an AI explanation of a file |
+| **review_code** | Review a file for bugs, security, and improvements |
+| **ask_ai** | Ask a coding question |
+| **ai_status** | Check configured providers |
 
 ## How fallback works
 
@@ -118,4 +149,5 @@ Providers are tried in the order listed. Add more API keys = more fallback optio
 - Add all 5 provider keys to maximize your free AI usage across the day
 - Gemini has the most generous free tier (1M tokens/day)
 - Groq is the fastest (responses in <1 second)
-- OpenRouter gives access to DeepSeek which is excellent for coding
+- The `edit` command always shows a diff and asks for confirmation before saving
+- Use `explain` before `edit` if you want to understand a file first
