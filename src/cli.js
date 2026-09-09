@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { askAI, getProviderStatus } from "./router.js";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "fs";
-import { resolve, join, extname, basename, dirname } from "path";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "fs";
+import { resolve, join, extname, basename, dirname, relative } from "path";
 import { createInterface } from "readline";
 
 const args = process.argv.slice(2);
@@ -20,6 +20,7 @@ Usage:
   free-ai explain <file>                 Explain a code file
   free-ai review <file>                  Review a code file for issues
   free-ai generate <file> "instruction"  Generate a new file with AI
+  free-ai scan [dir]                     Scan project/directory structure
   free-ai status                         Show configured providers
   free-ai help                           Show this help
 
@@ -30,11 +31,15 @@ Interactive mode commands:
     "review app/views/sales/_form.html.erb"
     "create app/services/stock_alert.rb service that checks low stock"
     "read app/models/product.rb"
+    "ls app/models"  or  "scan app/controllers"
     "what is the best way to add pagination in Rails?"
 
   Special commands:
+    /scan      Scan current project structure
+    /ls [dir]  List files in a directory
     /status    Show provider status
     /help      Show help
+    /clear     Clear conversation
     /exit      Exit chat
 
 Providers are tried in order. If one is rate-limited, the next is used.
@@ -48,6 +53,17 @@ const LANG_MAP = {
   yml: "yaml", yaml: "yaml", json: "json", md: "markdown",
   rake: "ruby", gemspec: "ruby", vue: "vue", svelte: "svelte",
 };
+
+const IGNORE_DIRS = new Set([
+  "node_modules", ".git", "vendor", "tmp", "log", ".bundle",
+  "coverage", "dist", "build", ".next", "__pycache__", ".cache",
+  "storage", "public/assets", "public/packs", ".DS_Store",
+]);
+
+const IGNORE_EXTS = new Set([
+  ".lock", ".map", ".min.js", ".min.css", ".ico", ".png",
+  ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot",
+]);
 
 function getLang(filePath) {
   const ext = filePath.split(".").pop();
@@ -78,15 +94,23 @@ function confirm(question) {
   });
 }
 
+function expandPath(p) {
+  if (p.startsWith("~")) {
+    return p.replace("~", process.env.HOME || "/Users/" + process.env.USER);
+  }
+  return p;
+}
+
 function readFile(filePath) {
-  const resolved = resolve(filePath);
+  const resolved = resolve(expandPath(filePath));
   if (!existsSync(resolved)) {
     printColored(`File not found: ${resolved}\n`, "red");
     printColored(`  (input: ${filePath}, cwd: ${process.cwd()})\n`, "dim");
     return null;
   }
   if (statSync(resolved).isDirectory()) {
-    printColored(`Path is a directory, not a file: ${resolved}\n`, "red");
+    printColored(`Path is a directory: ${resolved}\n`, "yellow");
+    printColored(`  Use "ls ${filePath}" or "scan ${filePath}" to see contents.\n`, "dim");
     return null;
   }
   try {
@@ -112,41 +136,160 @@ function extractCodeBlock(text) {
   return text;
 }
 
-function findFilePath(input) {
+function findPath(input) {
   const patterns = [
-    // Absolute paths: /Users/tarun/project/app/models/user.rb
+    // Absolute paths with extension
     /(?:^|\s)(\/[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
-    // Relative paths: app/models/user.rb or ./src/index.js
+    // Relative paths with extension
     /(?:^|\s)(\.{0,2}[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
-    // Paths with ~ (home dir): ~/rails_apps/inventory/app/models/user.rb
+    // ~ paths with extension
     /(?:^|\s)(~[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
-    // Any path with a slash
+    // Absolute directory paths (e.g., /Users/tarun/project/app/models)
     /(?:^|\s)(\/[\w./-]+\/[\w.-]+)\b/,
-    /(?:^|\s)([\w./-]+\/[\w.-]+)\b/,
+    // Relative directory paths (e.g., app/models, app/controllers)
+    /(?:^|\s)([\w.-]+\/[\w./-]*[\w.-]+)\b/,
+    // ~ directory paths
+    /(?:^|\s)(~\/[\w./-]+)\b/,
   ];
   for (const pattern of patterns) {
     const match = input.match(pattern);
     if (match) {
-      let p = match[1];
-      // Expand ~ to home directory
-      if (p.startsWith("~")) {
-        p = p.replace("~", process.env.HOME || "/Users/" + process.env.USER);
-      }
-      return p;
+      return expandPath(match[1]);
     }
   }
   return null;
 }
 
-// --- Core operations (shared by CLI commands and chat) ---
+function isDirectory(p) {
+  const resolved = resolve(expandPath(p));
+  return existsSync(resolved) && statSync(resolved).isDirectory();
+}
+
+function isFile(p) {
+  const resolved = resolve(expandPath(p));
+  return existsSync(resolved) && statSync(resolved).isFile();
+}
+
+// --- Directory scanning ---
+
+function scanDir(dirPath, prefix = "", maxDepth = 4, depth = 0) {
+  if (depth >= maxDepth) return [];
+  const resolved = resolve(expandPath(dirPath));
+  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) return [];
+
+  const entries = [];
+  try {
+    const items = readdirSync(resolved).sort();
+    for (const item of items) {
+      if (IGNORE_DIRS.has(item) || item.startsWith(".")) continue;
+      const fullPath = join(resolved, item);
+      const relPath = join(dirPath, item);
+      const stat = statSync(fullPath);
+
+      if (stat.isDirectory()) {
+        entries.push({ type: "dir", path: relPath, name: item });
+        entries.push(...scanDir(relPath, prefix, maxDepth, depth + 1));
+      } else if (stat.isFile()) {
+        const ext = extname(item);
+        if (IGNORE_EXTS.has(ext)) continue;
+        entries.push({ type: "file", path: relPath, name: item, size: stat.size });
+      }
+    }
+  } catch {}
+  return entries;
+}
+
+function doScan(dirPath) {
+  const resolved = resolve(expandPath(dirPath || "."));
+  if (!existsSync(resolved)) {
+    printColored(`Directory not found: ${resolved}\n`, "red");
+    return null;
+  }
+  if (!statSync(resolved).isDirectory()) {
+    printColored(`Not a directory: ${resolved}\n`, "red");
+    return null;
+  }
+
+  const entries = scanDir(dirPath || ".");
+  const dirs = entries.filter((e) => e.type === "dir");
+  const files = entries.filter((e) => e.type === "file");
+
+  printColored(`\n  📁 ${resolved}\n`, "bold");
+  printColored(`  ${dirs.length} directories, ${files.length} files\n\n`, "dim");
+
+  // Show tree
+  let lastDir = "";
+  for (const entry of entries) {
+    const parts = entry.path.split("/");
+    const indent = "  ".repeat(Math.min(parts.length, 6));
+
+    if (entry.type === "dir") {
+      printColored(`${indent}📁 ${entry.name}/\n`, "cyan");
+      lastDir = entry.path;
+    } else {
+      const sizeKb = (entry.size / 1024).toFixed(1);
+      printColored(`${indent}  ${entry.name}`, "dim");
+      if (entry.size > 10240) {
+        printColored(` (${sizeKb}KB)`, "yellow");
+      }
+      console.log();
+    }
+  }
+  console.log();
+
+  // Return as context string for AI
+  const tree = entries.map((e) =>
+    e.type === "dir" ? `${e.path}/` : e.path
+  ).join("\n");
+  return tree;
+}
+
+function doLs(dirPath) {
+  const resolved = resolve(expandPath(dirPath || "."));
+  if (!existsSync(resolved)) {
+    printColored(`Directory not found: ${resolved}\n`, "red");
+    return;
+  }
+  if (!statSync(resolved).isDirectory()) {
+    printColored(`Not a directory: ${resolved}\n`, "red");
+    return;
+  }
+
+  try {
+    const items = readdirSync(resolved).sort();
+    printColored(`\n  ${resolved}\n\n`, "bold");
+    for (const item of items) {
+      if (item.startsWith(".")) continue;
+      const fullPath = join(resolved, item);
+      const stat = statSync(fullPath);
+      if (stat.isDirectory()) {
+        printColored(`  📁 ${item}/\n`, "cyan");
+      } else {
+        printColored(`     ${item}\n`, "dim");
+      }
+    }
+    console.log();
+  } catch {
+    printColored(`Cannot read directory: ${resolved}\n`, "red");
+  }
+}
+
+// --- Core operations ---
 
 async function doEdit(filePath, instruction) {
   const code = readFile(filePath);
   if (code === null) return;
 
   const lang = getLang(filePath);
-  const prompt = `You are editing the file "${filePath}" (${lang}).
 
+  // Get project structure for context
+  const projectTree = scanDir(".", "", 2);
+  const treeContext = projectTree.length > 0
+    ? `\nProject structure (top-level):\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n")}\n`
+    : "";
+
+  const prompt = `You are editing the file "${filePath}" (${lang}) in a project.
+${treeContext}
 Here is the current content of the file:
 \`\`\`${lang}
 ${code}
@@ -198,7 +341,9 @@ Return ONLY the complete updated file content inside a single code block. Do not
 
     const ok = await confirm("  Apply changes? (y/n) ");
     if (ok) {
-      writeFileSync(resolve(filePath), newCode);
+      const dir = dirname(resolve(expandPath(filePath)));
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(resolve(expandPath(filePath)), newCode);
       printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
     } else {
       printColored("\n  ✗ Changes discarded.\n\n", "yellow");
@@ -209,6 +354,36 @@ Return ONLY the complete updated file content inside a single code block. Do not
 }
 
 async function doExplain(filePath) {
+  // If it's a directory, explain the project structure
+  if (isDirectory(filePath)) {
+    const tree = doScan(filePath);
+    if (!tree) return;
+
+    const prompt = `Explain the project structure of this directory "${filePath}":
+
+${tree}
+
+Describe:
+1. What kind of project this is (framework, language, purpose)
+2. Key directories and what they contain
+3. Important files to look at first
+4. Architecture pattern used
+
+Be concise.`;
+
+    printColored(`⏳ Analyzing project structure...\n\n`, "dim");
+
+    try {
+      const result = await askAI(prompt);
+      printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+      console.log(result.text);
+      console.log();
+    } catch (err) {
+      printColored(`Error: ${err.message}\n`, "red");
+    }
+    return;
+  }
+
   const code = readFile(filePath);
   if (code === null) return;
 
@@ -237,6 +412,48 @@ ${code}
 }
 
 async function doReview(filePath) {
+  // If it's a directory, review all files in it
+  if (isDirectory(filePath)) {
+    const entries = scanDir(filePath, "", 1);
+    const files = entries.filter((e) => e.type === "file" && e.size < 50000);
+    if (files.length === 0) {
+      printColored(`No reviewable files in ${filePath}\n`, "yellow");
+      return;
+    }
+
+    printColored(`\n  Reviewing ${files.length} files in ${filePath}/...\n\n`, "bold");
+
+    let allCode = "";
+    for (const f of files.slice(0, 10)) {
+      try {
+        const content = readFileSync(resolve(expandPath(f.path)), "utf-8");
+        allCode += `\n--- ${f.path} ---\n${content}\n`;
+      } catch {}
+    }
+
+    const prompt = `Review the following code files from "${filePath}/". Check for:
+1. Bugs or logic errors
+2. Security vulnerabilities
+3. Performance issues
+4. Best practice improvements
+
+Be concise — only mention real issues. Reference file names.
+
+${allCode}`;
+
+    printColored(`⏳ Reviewing ${filePath}/...\n\n`, "dim");
+
+    try {
+      const result = await askAI(prompt);
+      printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+      console.log(result.text);
+      console.log();
+    } catch (err) {
+      printColored(`Error: ${err.message}\n`, "red");
+    }
+    return;
+  }
+
   const code = readFile(filePath);
   if (code === null) return;
 
@@ -265,13 +482,18 @@ ${code}
   }
 }
 
-async function doRead(filePath) {
-  const code = readFile(filePath);
+async function doRead(pathArg) {
+  if (isDirectory(pathArg)) {
+    doLs(pathArg);
+    return;
+  }
+
+  const code = readFile(pathArg);
   if (code === null) return;
 
-  const lang = getLang(filePath);
+  const lang = getLang(pathArg);
   const lines = code.split("\n");
-  printColored(`\n  ${filePath} (${lang}, ${lines.length} lines)\n\n`, "bold");
+  printColored(`\n  ${pathArg} (${lang}, ${lines.length} lines)\n\n`, "bold");
   lines.forEach((l, i) => {
     printColored(`  ${String(i + 1).padStart(4)} `, "dim");
     console.log(l);
@@ -280,16 +502,24 @@ async function doRead(filePath) {
 }
 
 async function doGenerate(filePath, instruction) {
-  if (existsSync(resolve(filePath))) {
+  if (existsSync(resolve(expandPath(filePath)))) {
     printColored(`File already exists: ${filePath}. Use "edit" instead.\n`, "red");
     return;
   }
 
   const lang = getLang(filePath);
-  const prompt = `Generate the content for a new ${lang} file at "${filePath}".
 
+  // Get project structure for context
+  const projectTree = scanDir(".", "", 2);
+  const treeContext = projectTree.length > 0
+    ? `\nProject structure:\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n")}\n`
+    : "";
+
+  const prompt = `Generate the content for a new ${lang} file at "${filePath}" in this project.
+${treeContext}
 Instruction: ${instruction}
 
+Follow the patterns and conventions used in the existing project files.
 Return ONLY the file content inside a single code block. No explanations before or after.`;
 
   printColored(`⏳ Generating ${filePath}...\n\n`, "dim");
@@ -311,7 +541,9 @@ Return ONLY the file content inside a single code block. No explanations before 
 
     const ok = await confirm("  Create this file? (y/n) ");
     if (ok) {
-      writeFileSync(resolve(filePath), newCode);
+      const dir = dirname(resolve(expandPath(filePath)));
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(resolve(expandPath(filePath)), newCode);
       printColored(`\n  ✓ Created ${filePath}\n\n`, "green");
     } else {
       printColored("\n  ✗ File not created.\n\n", "yellow");
@@ -322,8 +554,18 @@ Return ONLY the file content inside a single code block. No explanations before 
 }
 
 async function doAsk(question, fileContext) {
-  const prompt = fileContext
-    ? `Context:\n\`\`\`\n${fileContext}\n\`\`\`\n\nQuestion: ${question}`
+  // Include project structure in context for better answers
+  const projectTree = scanDir(".", "", 2);
+  const treeSnippet = projectTree.length > 0
+    ? projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n")
+    : "";
+
+  let fullContext = "";
+  if (treeSnippet) fullContext += `Project structure:\n${treeSnippet}\n\n`;
+  if (fileContext) fullContext += `File content:\n\`\`\`\n${fileContext}\n\`\`\`\n\n`;
+
+  const prompt = fullContext
+    ? `${fullContext}Question: ${question}`
     : question;
 
   printColored("⏳ Thinking...\n\n", "dim");
@@ -334,11 +576,9 @@ async function doAsk(question, fileContext) {
     console.log(result.text);
     console.log();
 
-    // Add to conversation history
     chatHistory.push({ role: "user", content: question });
     chatHistory.push({ role: "assistant", content: result.text });
 
-    // Keep history manageable
     if (chatHistory.length > 20) {
       chatHistory = chatHistory.slice(-14);
     }
@@ -347,7 +587,7 @@ async function doAsk(question, fileContext) {
   }
 }
 
-// --- Conversation history for chat mode ---
+// --- Conversation history ---
 let chatHistory = [];
 
 // --- Interactive Chat Mode ---
@@ -363,6 +603,12 @@ async function startChat() {
   console.log();
   printColored(`  Project: ${cwd}\n`, "dim");
 
+  // Show quick project summary
+  const entries = scanDir(".", "", 1);
+  const dirs = entries.filter((e) => e.type === "dir");
+  const files = entries.filter((e) => e.type === "file");
+  printColored(`  Structure: ${dirs.length} dirs, ${files.length} top-level files\n`, "dim");
+
   const active = getProviderStatus().filter((p) => p.configured);
   if (active.length === 0) {
     printColored("\n  ⚠ No providers configured! Add API keys to .env\n", "yellow");
@@ -372,8 +618,8 @@ async function startChat() {
   printColored(`  Providers: ${active.map((p) => p.label).join(", ")}\n`, "dim");
 
   console.log();
-  printColored("  Type naturally — I can read, edit, review, and generate code.\n", "dim");
-  printColored("  Commands: /status /help /clear /exit\n", "dim");
+  printColored("  Type naturally — I can read, edit, review, and scan directories.\n", "dim");
+  printColored("  Commands: /scan /ls /status /help /clear /exit\n", "dim");
   console.log();
 
   const rl = createInterface({
@@ -396,8 +642,9 @@ async function startChat() {
       return;
     }
 
-    // Slash commands
-    if (input === "/exit" || input === "/quit" || input === "/q") {
+    // Exit commands (with or without slash)
+    if (input === "/exit" || input === "/quit" || input === "/q" ||
+        input === "exit" || input === "quit" || input === "q" || input === "bye") {
       printColored("\n  Goodbye!\n\n", "cyan");
       process.exit(0);
     }
@@ -417,52 +664,74 @@ async function startChat() {
       showPrompt();
       return;
     }
+    if (input.startsWith("/scan")) {
+      const dir = input.replace("/scan", "").trim() || ".";
+      doScan(dir);
+      showPrompt();
+      return;
+    }
+    if (input.startsWith("/ls")) {
+      const dir = input.replace("/ls", "").trim() || ".";
+      doLs(dir);
+      showPrompt();
+      return;
+    }
 
-    // Parse intent from natural language
     const lowerInput = input.toLowerCase();
-    const filePath = findFilePath(input);
+    const foundPath = findPath(input);
 
-    // Edit: "edit <file> <instruction>"
-    if (lowerInput.startsWith("edit ") && filePath) {
-      const instruction = input.replace(/^edit\s+/i, "").replace(filePath, "").trim();
+    // Scan/ls: "scan <dir>" or "ls <dir>"
+    if ((lowerInput.startsWith("scan ") || lowerInput.startsWith("ls ")) && foundPath) {
+      if (isDirectory(foundPath)) {
+        if (lowerInput.startsWith("scan ")) doScan(foundPath);
+        else doLs(foundPath);
+      } else {
+        printColored(`Not a directory: ${foundPath}\n`, "yellow");
+      }
+    }
+    // Edit: "edit <path> <instruction>"
+    else if (lowerInput.startsWith("edit ") && foundPath && isFile(foundPath)) {
+      const instruction = input.replace(/^edit\s+/i, "").replace(foundPath, "").trim();
       if (instruction) {
-        await doEdit(filePath, instruction);
+        await doEdit(foundPath, instruction);
       } else {
         printColored('  What changes? e.g., edit app/models/user.rb "add email validation"\n\n', "yellow");
       }
     }
-    // Review: "review <file>"
-    else if (lowerInput.startsWith("review ") && filePath) {
-      await doReview(filePath);
+    // Review: "review <path>" (file or directory)
+    else if (lowerInput.startsWith("review ") && foundPath) {
+      await doReview(foundPath);
     }
-    // Explain: "explain <file>"
-    else if (lowerInput.startsWith("explain ") && filePath) {
-      await doExplain(filePath);
+    // Explain: "explain <path>" (file or directory)
+    else if (lowerInput.startsWith("explain ") && foundPath) {
+      await doExplain(foundPath);
     }
-    // Read: "read <file>" or "show <file>" or "cat <file>"
-    else if ((lowerInput.startsWith("read ") || lowerInput.startsWith("show ") || lowerInput.startsWith("cat ")) && filePath) {
-      await doRead(filePath);
+    // Read/show/cat: "read <path>" (file or directory)
+    else if ((lowerInput.startsWith("read ") || lowerInput.startsWith("show ") || lowerInput.startsWith("cat ")) && foundPath) {
+      await doRead(foundPath);
     }
-    // Create/Generate: "create <file> <instruction>" or "generate <file> <instruction>"
-    else if ((lowerInput.startsWith("create ") || lowerInput.startsWith("generate ")) && filePath) {
-      const instruction = input.replace(/^(?:create|generate)\s+/i, "").replace(filePath, "").trim();
+    // Create/Generate: "create <path> <instruction>"
+    else if ((lowerInput.startsWith("create ") || lowerInput.startsWith("generate ")) && foundPath) {
+      const instruction = input.replace(/^(?:create|generate)\s+/i, "").replace(foundPath, "").trim();
       if (instruction) {
-        await doGenerate(filePath, instruction);
+        await doGenerate(foundPath, instruction);
       } else {
         printColored('  What should the file contain? e.g., create app/models/invoice.rb "model with validations"\n\n', "yellow");
       }
     }
     // If input has a file path + instruction, treat as edit
-    else if (filePath && existsSync(resolve(filePath)) && input.replace(filePath, "").trim().length > 5) {
-      const instruction = input.replace(filePath, "").trim();
-      await doEdit(filePath, instruction);
+    else if (foundPath && isFile(foundPath) && input.replace(foundPath, "").trim().length > 5) {
+      const instruction = input.replace(foundPath, "").trim();
+      await doEdit(foundPath, instruction);
     }
-    // Default: ask as a question
+    // Default: ask as a question (with file/dir context if mentioned)
     else {
       let fileContext = null;
-      // If a file is mentioned, include its content as context
-      if (filePath && existsSync(resolve(filePath))) {
-        fileContext = readFileSync(resolve(filePath), "utf-8");
+      if (foundPath && isFile(foundPath)) {
+        fileContext = readFileSync(resolve(expandPath(foundPath)), "utf-8");
+      } else if (foundPath && isDirectory(foundPath)) {
+        const tree = scanDir(foundPath, "", 2);
+        fileContext = `Directory "${foundPath}" contents:\n` + tree.map(e => e.type === "dir" ? e.path + "/" : e.path).join("\n");
       }
       await doAsk(input, fileContext);
     }
@@ -476,7 +745,7 @@ async function startChat() {
   });
 }
 
-// --- One-shot CLI command handlers (call shared functions) ---
+// --- One-shot CLI command handlers ---
 
 async function handleAsk() {
   let fileContent = null;
@@ -515,23 +784,23 @@ async function handleEdit() {
 }
 
 async function handleExplain() {
-  const filePath = args[1];
-  if (!filePath) {
-    printColored("Please provide a file path.\n", "red");
-    printColored("Usage: free-ai explain <file>\n", "dim");
+  const path = args[1];
+  if (!path) {
+    printColored("Please provide a file or directory path.\n", "red");
+    printColored("Usage: free-ai explain <file|dir>\n", "dim");
     process.exit(1);
   }
-  await doExplain(filePath);
+  await doExplain(path);
 }
 
 async function handleReview() {
-  const filePath = args[1];
-  if (!filePath) {
-    printColored("Please provide a file path.\n", "red");
-    printColored("Usage: free-ai review <file>\n", "dim");
+  const path = args[1];
+  if (!path) {
+    printColored("Please provide a file or directory path.\n", "red");
+    printColored("Usage: free-ai review <file|dir>\n", "dim");
     process.exit(1);
   }
-  await doReview(filePath);
+  await doReview(path);
 }
 
 async function handleGenerate() {
@@ -543,6 +812,11 @@ async function handleGenerate() {
     process.exit(1);
   }
   await doGenerate(filePath, instruction);
+}
+
+async function handleScan() {
+  const dir = args[1] || ".";
+  doScan(dir);
 }
 
 function handleStatus() {
@@ -576,7 +850,6 @@ function handleStatus() {
 
 switch (command) {
   case "chat":
-  case undefined:
     await startChat();
     break;
   case "ask":
@@ -594,6 +867,9 @@ switch (command) {
   case "generate":
     await handleGenerate();
     break;
+  case "scan":
+    await handleScan();
+    break;
   case "status":
     handleStatus();
     break;
@@ -603,7 +879,7 @@ switch (command) {
     console.log(HELP);
     break;
   default:
-    printColored(`Unknown command: ${command}\n`, "red");
-    console.log(HELP);
-    process.exit(1);
+    // If no known command, start chat mode
+    await startChat();
+    break;
 }
