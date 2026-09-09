@@ -81,13 +81,15 @@ function confirm(question) {
 function readFile(filePath) {
   const resolved = resolve(filePath);
   if (!existsSync(resolved)) {
-    printColored(`File not found: ${filePath}\n`, "red");
+    printColored(`File not found: ${resolved}\n`, "red");
+    printColored(`  (input: ${filePath}, cwd: ${process.cwd()})\n`, "dim");
     return null;
   }
   try {
     return readFileSync(resolved, "utf-8");
-  } catch {
-    printColored(`Cannot read file: ${filePath}\n`, "red");
+  } catch (err) {
+    printColored(`Cannot read file: ${resolved}\n`, "red");
+    printColored(`  ${err.message}\n`, "dim");
     return null;
   }
 }
@@ -108,12 +110,26 @@ function extractCodeBlock(text) {
 
 function findFilePath(input) {
   const patterns = [
-    /(?:^|\s)([\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
+    // Absolute paths: /Users/tarun/project/app/models/user.rb
+    /(?:^|\s)(\/[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
+    // Relative paths: app/models/user.rb or ./src/index.js
+    /(?:^|\s)(\.{0,2}[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
+    // Paths with ~ (home dir): ~/rails_apps/inventory/app/models/user.rb
+    /(?:^|\s)(~[\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
+    // Any path with a slash
+    /(?:^|\s)(\/[\w./-]+\/[\w.-]+)\b/,
     /(?:^|\s)([\w./-]+\/[\w.-]+)\b/,
   ];
   for (const pattern of patterns) {
     const match = input.match(pattern);
-    if (match) return match[1];
+    if (match) {
+      let p = match[1];
+      // Expand ~ to home directory
+      if (p.startsWith("~")) {
+        p = p.replace("~", process.env.HOME || "/Users/" + process.env.USER);
+      }
+      return p;
+    }
   }
   return null;
 }

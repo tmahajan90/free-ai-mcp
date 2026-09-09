@@ -4,11 +4,10 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const envPath = join(__dirname, "..", ".env");
 
-function loadEnv() {
-  if (!existsSync(envPath)) return;
-  const lines = readFileSync(envPath, "utf-8").split("\n");
+function loadEnvFile(path) {
+  if (!existsSync(path)) return;
+  const lines = readFileSync(path, "utf-8").split("\n");
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -20,7 +19,12 @@ function loadEnv() {
   }
 }
 
-loadEnv();
+// Load .env from the package directory (main config)
+loadEnvFile(join(__dirname, "..", ".env"));
+// Also load from current working directory (project-specific overrides)
+loadEnvFile(join(process.cwd(), ".env"));
+// Also load from home directory (global fallback)
+loadEnvFile(join(process.env.HOME || "", ".free-ai.env"));
 
 function getActiveProviders() {
   return PROVIDERS.filter((p) => process.env[p.envKey]);
