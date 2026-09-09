@@ -1,12 +1,12 @@
 import PROVIDERS from "./providers.js";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, statSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadEnvFile(path) {
-  if (!existsSync(path)) return;
+  if (!existsSync(path) || statSync(path).isDirectory()) return;
   const lines = readFileSync(path, "utf-8").split("\n");
   for (const line of lines) {
     const trimmed = line.trim();

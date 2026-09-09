@@ -85,6 +85,10 @@ function readFile(filePath) {
     printColored(`  (input: ${filePath}, cwd: ${process.cwd()})\n`, "dim");
     return null;
   }
+  if (statSync(resolved).isDirectory()) {
+    printColored(`Path is a directory, not a file: ${resolved}\n`, "red");
+    return null;
+  }
   try {
     return readFileSync(resolved, "utf-8");
   } catch (err) {
