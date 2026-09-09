@@ -123,15 +123,30 @@ function readFile(filePath) {
 }
 
 function extractCodeBlock(text) {
-  const match = text.match(/```[\w]*\n([\s\S]*?)```/);
-  if (match) return match[1].trimEnd() + "\n";
+  // Try to find the largest code block (AI sometimes returns multiple)
+  const allBlocks = [...text.matchAll(/```[\w]*\n([\s\S]*?)```/g)];
+  if (allBlocks.length > 0) {
+    // Pick the largest code block — that's the full file
+    let largest = allBlocks[0][1];
+    for (const block of allBlocks) {
+      if (block[1].length > largest.length) largest = block[1];
+    }
+    return largest.trimEnd() + "\n";
+  }
 
+  // No code block found — try to extract code by removing explanation lines
   const lines = text.split("\n");
-  const codeStart = lines.findIndex(
-    (l) => !l.startsWith("Here") && !l.startsWith("I ") && !l.startsWith("The ") && l.trim().length > 0
-  );
-  if (codeStart >= 0) {
-    return lines.slice(codeStart).join("\n").trimEnd() + "\n";
+  const codeLines = [];
+  let inCode = false;
+  for (const line of lines) {
+    // Skip common explanation prefixes
+    if (!inCode && /^(Here|I |The |This |Note|Above|Below|Let me|Sure|Okay|I've|I have|##|###|\*\*)/.test(line)) continue;
+    inCode = true;
+    codeLines.push(line);
+  }
+
+  if (codeLines.length > 0) {
+    return codeLines.join("\n").trimEnd() + "\n";
   }
   return text;
 }
@@ -288,16 +303,26 @@ async function doEdit(filePath, instruction) {
     ? `\nProject structure (top-level):\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n")}\n`
     : "";
 
-  const prompt = `You are editing the file "${filePath}" (${lang}) in a project.
+  const prompt = `TASK: Edit a file. Apply the instruction, then return the COMPLETE updated file.
+
+FILE: ${filePath}
+LANGUAGE: ${lang}
 ${treeContext}
-Here is the current content of the file:
+CURRENT FILE CONTENT:
 \`\`\`${lang}
 ${code}
 \`\`\`
 
-Instruction: ${instruction}
+INSTRUCTION: ${instruction}
 
-Return ONLY the complete updated file content inside a single code block. Do not include explanations before or after the code block. Do not omit any parts of the file — return the full file even if only a small part changed.`;
+RULES:
+1. Apply the instruction to the file above
+2. Return the ENTIRE file with changes applied — do NOT skip or truncate any part
+3. If the instruction says to remove something, actually remove it from the output
+4. If the instruction says to add something, add it in the right place
+5. Wrap your output in a single code block: \`\`\`${lang} ... \`\`\`
+6. Do NOT add any text before or after the code block — ONLY the code block
+7. Do NOT use "..." or "// rest of file" or any placeholders — output every single line`;
 
   printColored(`⏳ Editing ${filePath}...\n\n`, "dim");
 
@@ -306,6 +331,23 @@ Return ONLY the complete updated file content inside a single code block. Do not
     const newCode = extractCodeBlock(result.text);
 
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+
+    // Sanity check — if the returned code is suspiciously short, warn user
+    const originalLen = code.length;
+    const newLen = newCode.length;
+    if (newLen < originalLen * 0.3 && originalLen > 100) {
+      printColored("  ⚠ Warning: AI returned a much shorter file than the original.\n", "yellow");
+      printColored(`  Original: ${originalLen} chars, AI returned: ${newLen} chars\n`, "yellow");
+      printColored("  The AI may have truncated the file. Showing raw response:\n\n", "yellow");
+      console.log(result.text.slice(0, 500));
+      if (result.text.length > 500) printColored(`\n  ... (${result.text.length - 500} more chars)\n`, "dim");
+      console.log();
+      const proceed = await confirm("  Still want to try applying? (y/n) ");
+      if (!proceed) {
+        printColored("  ✗ Aborted.\n\n", "yellow");
+        return;
+      }
+    }
 
     const oldLines = code.split("\n").length;
     const newLines = newCode.split("\n").length;

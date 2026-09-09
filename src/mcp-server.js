@@ -87,16 +87,26 @@ server.tool(
       const code = readFileSync(resolved, "utf-8");
       const lang = getLang(file_path);
 
-      const prompt = `You are editing the file "${file_path}" (${lang}).
+      const prompt = `TASK: Edit a file. Apply the instruction, then return the COMPLETE updated file.
 
-Here is the current content of the file:
+FILE: ${file_path}
+LANGUAGE: ${lang}
+
+CURRENT FILE CONTENT:
 \`\`\`${lang}
 ${code}
 \`\`\`
 
-Instruction: ${instruction}
+INSTRUCTION: ${instruction}
 
-Return ONLY the complete updated file content inside a single code block. Do not include explanations before or after the code block. Do not omit any parts of the file — return the full file even if only a small part changed.`;
+RULES:
+1. Apply the instruction to the file above
+2. Return the ENTIRE file with changes applied — do NOT skip or truncate any part
+3. If the instruction says to remove something, actually remove it from the output
+4. If the instruction says to add something, add it in the right place
+5. Wrap your output in a single code block: \`\`\`${lang} ... \`\`\`
+6. Do NOT add any text before or after the code block — ONLY the code block
+7. Do NOT use "..." or "// rest of file" or any placeholders — output every single line`;
 
       const result = await askAI(prompt);
       const newCode = extractCodeBlock(result.text);
