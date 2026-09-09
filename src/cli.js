@@ -994,13 +994,10 @@ async function applyAIFixes(text) {
       }
     }
 
-    const ok = await confirm(`  Apply fix to ${filePath}? (y/n) `);
-    if (ok) {
-      saveUndo(filePath, code);
-      writeFileSync(resolve(expandPath(filePath)), newCode);
-      trackEdit(filePath);
-      printColored(`  ✓ Fixed ${filePath}\n`, "green");
-    }
+    saveUndo(filePath, code);
+    writeFileSync(resolve(expandPath(filePath)), newCode);
+    trackEdit(filePath);
+    printColored(`  ✓ Fixed ${filePath}\n`, "green");
   }
   console.log();
 }
@@ -1218,16 +1215,12 @@ RULES:
         console.log();
       }
 
-      const ok = await confirm("  Apply changes? (y/n) ");
-      if (ok) {
-        saveUndo(filePath, code);
-        writeFileSync(resolve(expandPath(filePath)), newCode);
-        trackEdit(filePath);
-        addToHistory(`Edit ${filePath}: ${instruction}`, `Applied ${applied.length} change(s) to ${filePath}`);
-        printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
-      } else {
-        printColored("\n  ✗ Changes discarded.\n\n", "yellow");
-      }
+      // Auto-apply (like Claude Code)
+      saveUndo(filePath, code);
+      writeFileSync(resolve(expandPath(filePath)), newCode);
+      trackEdit(filePath);
+      addToHistory(`Edit ${filePath}: ${instruction}`, `Applied ${applied.length} change(s) to ${filePath}`);
+      printColored(`  ✓ Saved ${filePath}  (undo: /undo)\n\n`, "green");
     } else {
       // No search/replace blocks — check if we got a usable code block
       const codeBlock = extractCodeBlock(result.text);
@@ -1251,15 +1244,10 @@ RULES:
                 else printColored(`  (removed)\n`, "red");
                 console.log();
               }
-              const ok = await confirm("  Apply changes? (y/n) ");
-              if (ok) {
-                saveUndo(filePath, code);
-                writeFileSync(resolve(expandPath(filePath)), newCode);
-                trackEdit(filePath);
-                printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
-              } else {
-                printColored("\n  ✗ Changes discarded.\n\n", "yellow");
-              }
+              saveUndo(filePath, code);
+              writeFileSync(resolve(expandPath(filePath)), newCode);
+              trackEdit(filePath);
+              printColored(`  ✓ Saved ${filePath}  (undo: /undo)\n\n`, "green");
               return;
             }
           }
@@ -1333,18 +1321,14 @@ Do NOT truncate, skip, or use placeholders. Every line must be present.`;
       return;
     }
 
-    const ok = await confirm("  Apply changes? (y/n) ");
-    if (ok) {
-      saveUndo(filePath, code);
-      const dir = dirname(resolve(expandPath(filePath)));
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(resolve(expandPath(filePath)), newCode);
-      trackEdit(filePath);
-      addToHistory(`Edit ${filePath}: ${instruction}`, `Applied changes to ${filePath} (full-file mode)`);
-      printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
-    } else {
-      printColored("\n  ✗ Changes discarded.\n\n", "yellow");
-    }
+    // Auto-apply
+    saveUndo(filePath, code);
+    const dir = dirname(resolve(expandPath(filePath)));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(expandPath(filePath)), newCode);
+    trackEdit(filePath);
+    addToHistory(`Edit ${filePath}: ${instruction}`, `Applied changes to ${filePath} (full-file mode)`);
+    printColored(`  ✓ Saved ${filePath}  (undo: /undo)\n\n`, "green");
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
   }
@@ -1550,16 +1534,11 @@ Return ONLY the file content inside a single code block. No explanations before 
     if (lines.length > 25) printColored(`  ... (${lines.length - 25} more lines)\n`, "dim");
     console.log();
 
-    const ok = await confirm("  Create this file? (y/n) ");
-    if (ok) {
-      const dir = dirname(resolve(expandPath(filePath)));
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(resolve(expandPath(filePath)), newCode);
-      addToHistory(`Create ${filePath}: ${instruction}`, `Created ${filePath} (${lines.length} lines)`);
-      printColored(`\n  ✓ Created ${filePath}\n\n`, "green");
-    } else {
-      printColored("\n  ✗ File not created.\n\n", "yellow");
-    }
+    const dir = dirname(resolve(expandPath(filePath)));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(expandPath(filePath)), newCode);
+    addToHistory(`Create ${filePath}: ${instruction}`, `Created ${filePath} (${lines.length} lines)`);
+    printColored(`\n  ✓ Created ${filePath}\n\n`, "green");
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
   }
