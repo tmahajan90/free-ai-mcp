@@ -371,6 +371,158 @@ function loadProjectMemory() {
 
 const projectMemory = loadProjectMemory();
 
+// --- Project type detection ---
+
+function detectProjectType() {
+  const cwd = process.cwd();
+  const checks = {
+    rails: () => existsSync(join(cwd, "Gemfile")) && existsSync(join(cwd, "config", "routes.rb")),
+    node: () => existsSync(join(cwd, "package.json")),
+    python: () => existsSync(join(cwd, "requirements.txt")) || existsSync(join(cwd, "pyproject.toml")),
+    go: () => existsSync(join(cwd, "go.mod")),
+    rust: () => existsSync(join(cwd, "Cargo.toml")),
+  };
+
+  for (const [type, check] of Object.entries(checks)) {
+    if (check()) return type;
+  }
+  return null;
+}
+
+function getProjectConventions() {
+  const type = detectProjectType();
+  if (!type) return "";
+
+  const conventions = {
+    rails: `Framework: Ruby on Rails
+Conventions: MVC pattern. Models in app/models/, controllers in app/controllers/, views in app/views/.
+Routes in config/routes.rb. Migrations in db/migrate/. Tests in test/ or spec/.
+Use Rails idioms: strong params, before_action, has_many/belongs_to, validates.
+Views use ERB templates with partials (_partial.html.erb).
+Follow RESTful resource naming.`,
+
+    node: `Framework: Node.js
+Check package.json for framework (Express, Next.js, React, etc.).
+Follow existing import style (ESM vs CommonJS).
+Use existing patterns for error handling and middleware.`,
+
+    python: `Framework: Python
+Check for Django (manage.py), Flask (app.py), or FastAPI.
+Follow PEP 8 style. Use type hints if the project uses them.
+Match existing patterns for imports and module structure.`,
+
+    go: `Framework: Go
+Follow Go conventions: short variable names, error handling with if err != nil.
+Match existing package structure and naming.`,
+
+    rust: `Framework: Rust
+Follow Rust conventions: ownership, borrowing, Result/Option types.
+Match existing module structure and error handling patterns.`,
+  };
+
+  return conventions[type] || "";
+}
+
+// --- Smart context: find related files ---
+
+function findRelatedFiles(filePath) {
+  const related = [];
+  const parts = filePath.split("/");
+  const fileName = basename(filePath, extname(filePath));
+  const ext = extname(filePath);
+  const type = detectProjectType();
+
+  if (type === "rails") {
+    // Controller -> Model, Routes
+    if (filePath.includes("controllers/") && filePath.endsWith("_controller.rb")) {
+      const modelName = fileName.replace("_controller", "").replace(/s$/, "");
+      const modelPath = `app/models/${modelName}.rb`;
+      if (existsSync(resolve(modelPath))) related.push(modelPath);
+
+      // Also check routes
+      const routesPath = "config/routes.rb";
+      if (existsSync(resolve(routesPath))) related.push(routesPath);
+    }
+    // Model -> Controller
+    if (filePath.includes("models/") && ext === ".rb") {
+      const controllerPath = `app/controllers/${fileName}s_controller.rb`;
+      if (existsSync(resolve(controllerPath))) related.push(controllerPath);
+    }
+    // View -> Controller + Model
+    if (filePath.includes("views/")) {
+      const viewDir = parts[parts.length - 2];
+      const controllerPath = `app/controllers/${viewDir}_controller.rb`;
+      if (existsSync(resolve(controllerPath))) related.push(controllerPath);
+      const modelName = viewDir.replace(/s$/, "");
+      const modelPath = `app/models/${modelName}.rb`;
+      if (existsSync(resolve(modelPath))) related.push(modelPath);
+    }
+    // Migration -> Model
+    if (filePath.includes("migrate/")) {
+      const match = fileName.match(/(?:create|add|remove|change)_(\w+)/);
+      if (match) {
+        const table = match[1].replace(/s$/, "");
+        const modelPath = `app/models/${table}.rb`;
+        if (existsSync(resolve(modelPath))) related.push(modelPath);
+      }
+    }
+  }
+
+  if (type === "node") {
+    // Component -> related files
+    const dir = dirname(filePath);
+    const possibleRelated = [
+      join(dir, fileName + ".test" + ext),
+      join(dir, fileName + ".spec" + ext),
+      join(dir, fileName + ".module.css"),
+      join(dir, "index" + ext),
+    ];
+    for (const p of possibleRelated) {
+      if (existsSync(resolve(p)) && p !== filePath) related.push(p);
+    }
+  }
+
+  return related.slice(0, 3);
+}
+
+function readRelatedContext(filePath) {
+  const related = findRelatedFiles(filePath);
+  if (related.length === 0) return "";
+
+  let ctx = "\nRelated files for context:\n";
+  for (const rp of related) {
+    try {
+      const content = readFileSync(resolve(rp), "utf-8");
+      // Truncate large files
+      const truncated = content.length > 3000 ? content.slice(0, 3000) + "\n... (truncated)" : content;
+      ctx += `\n--- ${rp} ---\n${truncated}\n`;
+    } catch {}
+  }
+  return ctx;
+}
+
+// --- Find similar file for pattern matching ---
+
+function findSimilarFile(filePath) {
+  const dir = dirname(filePath);
+  const ext = extname(filePath);
+
+  if (!existsSync(resolve(dir))) return null;
+
+  try {
+    const siblings = readdirSync(resolve(dir)).filter(f => extname(f) === ext && f !== basename(filePath));
+    if (siblings.length === 0) return null;
+
+    // Pick the first sibling as a pattern reference
+    const similarPath = join(dir, siblings[0]);
+    const content = readFileSync(resolve(similarPath), "utf-8");
+    if (content.length > 4000) return { path: similarPath, content: content.slice(0, 4000) + "\n... (truncated)" };
+    return { path: similarPath, content };
+  } catch {
+    return null;
+  }
+}
+
 // --- Session tracking ---
 
 const sessionEdits = [];
@@ -984,13 +1136,16 @@ async function doEdit(filePath, instruction) {
     : "";
 
   const memoryContext = projectMemory ? `\nProject context:\n${projectMemory}\n` : "";
+  const conventions = getProjectConventions();
+  const conventionsCtx = conventions ? `\n${conventions}\n` : "";
+  const relatedCtx = readRelatedContext(filePath);
   const historyContext = getHistoryContext();
   const conversationCtx = historyContext ? `\nRecent conversation:\n${historyContext}\n` : "";
 
   const prompt = `TASK: Edit a file using SEARCH/REPLACE blocks.
 
 FILE: ${filePath} (${lang}, ${lineCount} lines)
-${treeContext}${memoryContext}${conversationCtx}
+${treeContext}${memoryContext}${conventionsCtx}${relatedCtx}${conversationCtx}
 CURRENT FILE CONTENT:
 \`\`\`${lang}
 ${code}
@@ -1364,11 +1519,18 @@ async function doGenerate(filePath, instruction) {
 
   const histCtx = getHistoryContext();
   const memCtx = projectMemory ? `\nProject context:\n${projectMemory}\n` : "";
+  const conventions = getProjectConventions();
+  const conventionsCtx = conventions ? `\n${conventions}\n` : "";
+  const similar = findSimilarFile(filePath);
+  const patternCtx = similar
+    ? `\nFollow the pattern of this existing file (${similar.path}):\n\`\`\`${lang}\n${similar.content}\n\`\`\`\n`
+    : "";
+
   const prompt = `Generate the content for a new ${lang} file at "${filePath}" in this project.
-${treeContext}${memCtx}${histCtx ? `\nRecent conversation:\n${histCtx}\n` : ""}
+${treeContext}${memCtx}${conventionsCtx}${patternCtx}${histCtx ? `\nRecent conversation:\n${histCtx}\n` : ""}
 Instruction: ${instruction}
 
-Follow the patterns and conventions used in the existing project files.
+IMPORTANT: Match the exact style, patterns, and conventions of the existing project files shown above.
 Return ONLY the file content inside a single code block. No explanations before or after.`;
 
   printColored(`⏳ Generating ${filePath}...\n\n`, "dim");
@@ -1411,6 +1573,8 @@ async function doAsk(question, fileContext, imageParts) {
 
   let fullContext = "";
   if (projectMemory) fullContext += `Project context:\n${projectMemory}\n\n`;
+  const conventions = getProjectConventions();
+  if (conventions) fullContext += `${conventions}\n\n`;
   if (treeSnippet) fullContext += `Project structure:\n${treeSnippet}\n\n`;
   const recent = getRecentContext();
   if (recent) fullContext += `${recent}\n\n`;
@@ -1494,7 +1658,10 @@ async function startChat() {
   const entries = scanDir(".", "", 1);
   const dirs = entries.filter((e) => e.type === "dir");
   const files = entries.filter((e) => e.type === "file");
-  printColored(`  Structure: ${dirs.length} dirs, ${files.length} top-level files\n`, "dim");
+  const detectedType = detectProjectType();
+  printColored(`  Structure: ${dirs.length} dirs, ${files.length} top-level files`, "dim");
+  if (detectedType) printColored(` (${detectedType})`, "cyan");
+  console.log();
 
   const active = getProviderStatus().filter((p) => p.configured);
   if (active.length === 0) {
