@@ -9,7 +9,7 @@ const args = process.argv.slice(2);
 const command = args[0];
 
 const HELP = `
-free-ai — Free AI coding agent with file read/edit capabilities
+free-ai — Free AI coding agent (like Claude Code, but free)
 
 Usage:
   free-ai                                Start interactive chat mode
@@ -24,26 +24,43 @@ Usage:
   free-ai status                         Show configured providers
   free-ai help                           Show this help
 
-Interactive mode commands:
-  Just type naturally:
+Interactive mode — type naturally:
+  Edit files:
     "edit app/models/user.rb add email validation"
+    "add pagination to app/controllers/products_controller.rb"
+    "remove the header from app/views/layouts/application.html.erb"
+    "fix the N+1 query in app/models/order.rb"
+
+  Read/explore:
+    "read app/models/product.rb"
     "explain app/controllers/sales_controller.rb"
     "review app/views/sales/_form.html.erb"
-    "create app/services/stock_alert.rb service that checks low stock"
-    "read app/models/product.rb"
     "ls app/models"  or  "scan app/controllers"
-    "what is the best way to add pagination in Rails?"
 
-  Special commands:
-    /scan      Scan current project structure
+  Create files:
+    "create app/services/stock_alert.rb service that checks low stock"
+
+  Shell & Git:
+    !bundle exec rails test           Run any shell command
+    run npm install                    Same as ! prefix
+    git status                         Git commands run directly
+    git diff                           View changes
+
+  Ask questions:
+    "what is the best way to add pagination in Rails?"
+    "how does the auth flow work in this project?"
+
+  Commands:
+    /scan      Scan project structure
     /ls [dir]  List files in a directory
     /status    Show provider status
+    /undo      Undo last file edit
     /help      Show help
     /clear     Clear conversation
     /exit      Exit chat
 
+Edit engine uses SEARCH/REPLACE blocks (like Claude Code) for precise changes.
 Providers are tried in order. If one is rate-limited, the next is used.
-Configure API keys in: .env file
 `;
 
 const LANG_MAP = {
@@ -289,6 +306,70 @@ function doLs(dirPath) {
   }
 }
 
+// --- Shell command execution ---
+
+async function doRun(cmd) {
+  const { execSync } = await import("child_process");
+  printColored(`  $ ${cmd}\n\n`, "dim");
+  try {
+    const output = execSync(cmd, { encoding: "utf-8", timeout: 30000, cwd: process.cwd() });
+    if (output.trim()) console.log(output);
+    return output;
+  } catch (err) {
+    printColored(`  Error: ${err.message}\n`, "red");
+    if (err.stdout) console.log(err.stdout);
+    if (err.stderr) printColored(`  ${err.stderr}\n`, "red");
+    return null;
+  }
+}
+
+// --- Search/Replace edit engine (like Claude Code) ---
+
+function parseSearchReplace(text) {
+  const blocks = [];
+  const pattern = /<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    blocks.push({ search: match[1], replace: match[2] });
+  }
+  return blocks;
+}
+
+function applySearchReplace(code, blocks) {
+  let result = code;
+  const applied = [];
+  const failed = [];
+
+  for (const block of blocks) {
+    // Try exact match first
+    if (result.includes(block.search)) {
+      result = result.replace(block.search, block.replace);
+      applied.push(block);
+    } else {
+      // Try trimmed match (whitespace differences)
+      const searchTrimmed = block.search.split("\n").map(l => l.trim()).join("\n");
+      const lines = result.split("\n");
+      let found = false;
+
+      for (let i = 0; i <= lines.length - block.search.split("\n").length; i++) {
+        const segment = lines.slice(i, i + block.search.split("\n").length);
+        const segmentTrimmed = segment.map(l => l.trim()).join("\n");
+        if (segmentTrimmed === searchTrimmed) {
+          const before = lines.slice(0, i);
+          const after = lines.slice(i + block.search.split("\n").length);
+          result = [...before, ...block.replace.split("\n"), ...after].join("\n");
+          applied.push(block);
+          found = true;
+          break;
+        }
+      }
+      if (!found) failed.push(block);
+    }
+  }
+
+  return { result, applied, failed };
+}
+
 // --- Core operations ---
 
 async function doEdit(filePath, instruction) {
@@ -296,17 +377,17 @@ async function doEdit(filePath, instruction) {
   if (code === null) return;
 
   const lang = getLang(filePath);
+  const lineCount = code.split("\n").length;
 
   // Get project structure for context
   const projectTree = scanDir(".", "", 2);
   const treeContext = projectTree.length > 0
-    ? `\nProject structure (top-level):\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n")}\n`
+    ? `\nProject structure:\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n")}\n`
     : "";
 
-  const prompt = `TASK: Edit a file. Apply the instruction, then return the COMPLETE updated file.
+  const prompt = `TASK: Edit a file using SEARCH/REPLACE blocks.
 
-FILE: ${filePath}
-LANGUAGE: ${lang}
+FILE: ${filePath} (${lang}, ${lineCount} lines)
 ${treeContext}
 CURRENT FILE CONTENT:
 \`\`\`${lang}
@@ -315,16 +396,104 @@ ${code}
 
 INSTRUCTION: ${instruction}
 
+RESPOND WITH SEARCH/REPLACE BLOCKS. For each change, output:
+
+<<<<<<< SEARCH
+exact lines from the original file to find
+=======
+replacement lines (or empty to delete)
+>>>>>>> REPLACE
+
 RULES:
-1. Apply the instruction to the file above
-2. Return the ENTIRE file with changes applied — do NOT skip or truncate any part
-3. If the instruction says to remove something, actually remove it from the output
-4. If the instruction says to add something, add it in the right place
-5. Wrap your output in a single code block: \`\`\`${lang} ... \`\`\`
-6. Do NOT add any text before or after the code block — ONLY the code block
-7. Do NOT use "..." or "// rest of file" or any placeholders — output every single line`;
+1. Each SEARCH block must contain the EXACT text from the file (copy-paste, don't retype)
+2. Include enough context lines in SEARCH so it matches uniquely
+3. To REMOVE code: leave the REPLACE section empty
+4. To ADD code: use a SEARCH block with the lines around where you want to insert
+5. You can output multiple SEARCH/REPLACE blocks for multiple changes
+6. After all blocks, write a one-line summary of what changed`;
 
   printColored(`⏳ Editing ${filePath}...\n\n`, "dim");
+
+  try {
+    const result = await askAI(prompt);
+    printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+
+    // Try search/replace approach first
+    const blocks = parseSearchReplace(result.text);
+
+    if (blocks.length > 0) {
+      // Search/replace mode
+      const { result: newCode, applied, failed } = applySearchReplace(code, blocks);
+
+      if (applied.length === 0) {
+        printColored("  ⚠ Could not match any SEARCH blocks in the file.\n", "yellow");
+        printColored("  AI response:\n\n", "dim");
+        console.log(result.text.slice(0, 800));
+        console.log();
+
+        // Fallback: try full-file mode
+        printColored("  Retrying with full-file mode...\n\n", "dim");
+        await doEditFullFile(filePath, code, lang, instruction, treeContext);
+        return;
+      }
+
+      if (failed.length > 0) {
+        printColored(`  ⚠ ${failed.length} change(s) could not be matched.\n`, "yellow");
+      }
+
+      // Show changes
+      printColored(`  File: ${filePath}\n`, "bold");
+      printColored(`  ${applied.length} change(s) applied:\n\n`, "green");
+
+      for (const block of applied) {
+        if (block.search.trim()) {
+          const searchLines = block.search.split("\n");
+          searchLines.slice(0, 8).forEach(l => printColored(`  - ${l}\n`, "red"));
+          if (searchLines.length > 8) printColored(`  ... (${searchLines.length - 8} more)\n`, "dim");
+        }
+        if (block.replace.trim()) {
+          const replaceLines = block.replace.split("\n");
+          replaceLines.slice(0, 8).forEach(l => printColored(`  + ${l}\n`, "green"));
+          if (replaceLines.length > 8) printColored(`  ... (${replaceLines.length - 8} more)\n`, "dim");
+        } else {
+          printColored(`  (removed)\n`, "red");
+        }
+        console.log();
+      }
+
+      const ok = await confirm("  Apply changes? (y/n) ");
+      if (ok) {
+        saveUndo(filePath, code);
+        writeFileSync(resolve(expandPath(filePath)), newCode);
+        printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
+      } else {
+        printColored("\n  ✗ Changes discarded.\n\n", "yellow");
+      }
+    } else {
+      // No search/replace blocks — try extracting a full file code block
+      await doEditFullFile(filePath, code, lang, instruction, treeContext);
+    }
+  } catch (err) {
+    printColored(`Error: ${err.message}\n`, "red");
+  }
+}
+
+async function doEditFullFile(filePath, code, lang, instruction, treeContext) {
+  const prompt = `TASK: Edit a file. Return the COMPLETE updated file.
+
+FILE: ${filePath} (${lang})
+${treeContext || ""}
+CURRENT FILE CONTENT:
+\`\`\`${lang}
+${code}
+\`\`\`
+
+INSTRUCTION: ${instruction}
+
+Return the ENTIRE file with changes applied inside a code block.
+Do NOT truncate, skip, or use placeholders. Every line must be present.`;
+
+  printColored(`⏳ Applying edit (full-file mode)...\n\n`, "dim");
 
   try {
     const result = await askAI(prompt);
@@ -332,47 +501,34 @@ RULES:
 
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
 
-    // Sanity check — if the returned code is suspiciously short, warn user
     const originalLen = code.length;
     const newLen = newCode.length;
     if (newLen < originalLen * 0.3 && originalLen > 100) {
-      printColored("  ⚠ Warning: AI returned a much shorter file than the original.\n", "yellow");
-      printColored(`  Original: ${originalLen} chars, AI returned: ${newLen} chars\n`, "yellow");
-      printColored("  The AI may have truncated the file. Showing raw response:\n\n", "yellow");
-      console.log(result.text.slice(0, 500));
-      if (result.text.length > 500) printColored(`\n  ... (${result.text.length - 500} more chars)\n`, "dim");
-      console.log();
-      const proceed = await confirm("  Still want to try applying? (y/n) ");
-      if (!proceed) {
-        printColored("  ✗ Aborted.\n\n", "yellow");
-        return;
-      }
+      printColored("  ⚠ AI returned a much shorter file — likely truncated.\n", "yellow");
+      printColored(`  Original: ${originalLen} chars → AI: ${newLen} chars\n\n`, "yellow");
+      return;
     }
 
     const oldLines = code.split("\n").length;
     const newLines = newCode.split("\n").length;
-    const diff = newLines - oldLines;
     printColored(`  File: ${filePath}\n`, "bold");
-    printColored(`  Lines: ${oldLines} → ${newLines}`, "dim");
-    if (diff > 0) printColored(` (+${diff})`, "green");
-    else if (diff < 0) printColored(` (${diff})`, "red");
-    console.log("\n");
+    printColored(`  Lines: ${oldLines} → ${newLines}\n\n`, "dim");
 
     const oldSet = new Set(code.split("\n"));
     const newSet = new Set(newCode.split("\n"));
-    const added = newCode.split("\n").filter((l) => !oldSet.has(l));
-    const removed = code.split("\n").filter((l) => !newSet.has(l));
+    const added = newCode.split("\n").filter(l => !oldSet.has(l));
+    const removed = code.split("\n").filter(l => !newSet.has(l));
 
     if (removed.length > 0) {
       printColored("  Removed:\n", "red");
-      removed.slice(0, 15).forEach((l) => printColored(`  - ${l}\n`, "red"));
-      if (removed.length > 15) printColored(`  ... and ${removed.length - 15} more\n`, "dim");
+      removed.slice(0, 10).forEach(l => printColored(`  - ${l}\n`, "red"));
+      if (removed.length > 10) printColored(`  ... +${removed.length - 10} more\n`, "dim");
       console.log();
     }
     if (added.length > 0) {
       printColored("  Added:\n", "green");
-      added.slice(0, 15).forEach((l) => printColored(`  + ${l}\n`, "green"));
-      if (added.length > 15) printColored(`  ... and ${added.length - 15} more\n`, "dim");
+      added.slice(0, 10).forEach(l => printColored(`  + ${l}\n`, "green"));
+      if (added.length > 10) printColored(`  ... +${added.length - 10} more\n`, "dim");
       console.log();
     }
 
@@ -383,6 +539,7 @@ RULES:
 
     const ok = await confirm("  Apply changes? (y/n) ");
     if (ok) {
+      saveUndo(filePath, code);
       const dir = dirname(resolve(expandPath(filePath)));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(resolve(expandPath(filePath)), newCode);
@@ -632,6 +789,24 @@ async function doAsk(question, fileContext) {
 // --- Conversation history ---
 let chatHistory = [];
 
+// --- Undo stack ---
+let undoStack = [];
+
+function saveUndo(filePath, content) {
+  undoStack.push({ filePath, content, time: new Date().toLocaleTimeString() });
+  if (undoStack.length > 20) undoStack.shift();
+}
+
+function doUndo() {
+  if (undoStack.length === 0) {
+    printColored("  Nothing to undo.\n\n", "yellow");
+    return;
+  }
+  const last = undoStack.pop();
+  writeFileSync(resolve(expandPath(last.filePath)), last.content);
+  printColored(`  ✓ Undone last edit to ${last.filePath} (from ${last.time})\n\n`, "green");
+}
+
 // --- Interactive Chat Mode ---
 
 async function startChat() {
@@ -660,8 +835,9 @@ async function startChat() {
   printColored(`  Providers: ${active.map((p) => p.label).join(", ")}\n`, "dim");
 
   console.log();
-  printColored("  Type naturally — I can read, edit, review, and scan directories.\n", "dim");
-  printColored("  Commands: /scan /ls /status /help /clear /exit\n", "dim");
+  printColored("  Type naturally — I can read, edit, review, and scan your project.\n", "dim");
+  printColored("  Shell: !<command> or run <command>  |  Git: git status, git diff, etc.\n", "dim");
+  printColored("  Commands: /scan /ls /status /undo /help /clear /exit\n", "dim");
   console.log();
 
   const rl = createInterface({
@@ -706,6 +882,11 @@ async function startChat() {
       showPrompt();
       return;
     }
+    if (input === "/undo" || input === "undo") {
+      doUndo();
+      showPrompt();
+      return;
+    }
     if (input.startsWith("/scan")) {
       const dir = input.replace("/scan", "").trim() || ".";
       doScan(dir);
@@ -720,7 +901,31 @@ async function startChat() {
     }
 
     const lowerInput = input.toLowerCase();
+
+    // Shell commands: !<command> or "run <command>"
+    if (input.startsWith("!")) {
+      await doRun(input.slice(1).trim());
+      showPrompt();
+      return;
+    }
+    if (lowerInput.startsWith("run ") && !findPath(input)) {
+      await doRun(input.slice(4).trim());
+      showPrompt();
+      return;
+    }
+
+    // Git shorthand: "git status", "git diff", etc.
+    if (input.startsWith("git ")) {
+      await doRun(input);
+      showPrompt();
+      return;
+    }
+
     const foundPath = findPath(input);
+
+    // Detect edit intent from natural language
+    const editKeywords = /\b(add|remove|delete|change|replace|update|fix|rename|refactor|move|insert|modify|make|set|convert|wrap|unwrap|extract|inline)\b/i;
+    const isEditIntent = editKeywords.test(input) && foundPath && isFile(foundPath);
 
     // Scan/ls: "scan <dir>" or "ls <dir>"
     if ((lowerInput.startsWith("scan ") || lowerInput.startsWith("ls ")) && foundPath) {
@@ -760,6 +965,11 @@ async function startChat() {
       } else {
         printColored('  What should the file contain? e.g., create app/models/invoice.rb "model with validations"\n\n', "yellow");
       }
+    }
+    // Natural language edit: "add validation to app/models/user.rb", "remove the header from app/views/..."
+    else if (isEditIntent) {
+      const instruction = input.replace(foundPath, "").trim();
+      await doEdit(foundPath, instruction);
     }
     // If input has a file path + instruction, treat as edit
     else if (foundPath && isFile(foundPath) && input.replace(foundPath, "").trim().length > 5) {

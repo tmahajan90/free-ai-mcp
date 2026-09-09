@@ -24,9 +24,54 @@ function getLang(filePath) {
 }
 
 function extractCodeBlock(text) {
-  const match = text.match(/```[\w]*\n([\s\S]*?)```/);
-  if (match) return match[1].trimEnd() + "\n";
+  const allBlocks = [...text.matchAll(/```[\w]*\n([\s\S]*?)```/g)];
+  if (allBlocks.length > 0) {
+    let largest = allBlocks[0][1];
+    for (const block of allBlocks) {
+      if (block[1].length > largest.length) largest = block[1];
+    }
+    return largest.trimEnd() + "\n";
+  }
   return text;
+}
+
+function parseSearchReplace(text) {
+  const blocks = [];
+  const pattern = /<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    blocks.push({ search: match[1], replace: match[2] });
+  }
+  return blocks;
+}
+
+function applySearchReplace(code, blocks) {
+  let result = code;
+  const applied = [];
+  const failed = [];
+  for (const block of blocks) {
+    if (result.includes(block.search)) {
+      result = result.replace(block.search, block.replace);
+      applied.push(block);
+    } else {
+      const searchTrimmed = block.search.split("\n").map(l => l.trim()).join("\n");
+      const lines = result.split("\n");
+      let found = false;
+      for (let i = 0; i <= lines.length - block.search.split("\n").length; i++) {
+        const segment = lines.slice(i, i + block.search.split("\n").length);
+        if (segment.map(l => l.trim()).join("\n") === searchTrimmed) {
+          const before = lines.slice(0, i);
+          const after = lines.slice(i + block.search.split("\n").length);
+          result = [...before, ...block.replace.split("\n"), ...after].join("\n");
+          applied.push(block);
+          found = true;
+          break;
+        }
+      }
+      if (!found) failed.push(block);
+    }
+  }
+  return { result, applied, failed };
 }
 
 // --- Tools ---
@@ -68,7 +113,7 @@ server.tool(
 
 server.tool(
   "edit_code",
-  "Read a file, send it to a free AI with editing instructions, and save the updated file. Shows a diff before applying.",
+  "Edit a file using SEARCH/REPLACE blocks for precise changes. Falls back to full-file mode if needed.",
   {
     file_path: z.string().describe("Path to the file to edit"),
     instruction: z.string().describe("What changes to make to the file"),
@@ -86,11 +131,12 @@ server.tool(
 
       const code = readFileSync(resolved, "utf-8");
       const lang = getLang(file_path);
+      const lineCount = code.split("\n").length;
 
-      const prompt = `TASK: Edit a file. Apply the instruction, then return the COMPLETE updated file.
+      // Try search/replace first
+      const srPrompt = `TASK: Edit a file using SEARCH/REPLACE blocks.
 
-FILE: ${file_path}
-LANGUAGE: ${lang}
+FILE: ${file_path} (${lang}, ${lineCount} lines)
 
 CURRENT FILE CONTENT:
 \`\`\`${lang}
@@ -99,46 +145,79 @@ ${code}
 
 INSTRUCTION: ${instruction}
 
+RESPOND WITH SEARCH/REPLACE BLOCKS:
+
+<<<<<<< SEARCH
+exact lines from original file
+=======
+replacement lines (or empty to delete)
+>>>>>>> REPLACE
+
 RULES:
-1. Apply the instruction to the file above
-2. Return the ENTIRE file with changes applied — do NOT skip or truncate any part
-3. If the instruction says to remove something, actually remove it from the output
-4. If the instruction says to add something, add it in the right place
-5. Wrap your output in a single code block: \`\`\`${lang} ... \`\`\`
-6. Do NOT add any text before or after the code block — ONLY the code block
-7. Do NOT use "..." or "// rest of file" or any placeholders — output every single line`;
+1. SEARCH must contain EXACT text from the file
+2. Include enough context for unique matching
+3. To REMOVE code: leave REPLACE empty
+4. Multiple blocks allowed for multiple changes`;
 
-      const result = await askAI(prompt);
-      const newCode = extractCodeBlock(result.text);
-
-      const oldLines = code.split("\n");
-      const newLines = newCode.split("\n");
-      const oldSet = new Set(oldLines);
-      const newSet = new Set(newLines);
-      const added = newLines.filter((l) => !oldSet.has(l));
-      const removed = oldLines.filter((l) => !newSet.has(l));
+      const result = await askAI(srPrompt);
+      const blocks = parseSearchReplace(result.text);
 
       let diffText = `**Edit: ${file_path}** [${result.provider}]\n\n`;
-      diffText += `Lines: ${oldLines.length} → ${newLines.length}\n\n`;
+      let newCode;
 
-      if (removed.length > 0) {
-        diffText += "**Removed:**\n```\n" + removed.slice(0, 20).join("\n") + "\n```\n\n";
-      }
-      if (added.length > 0) {
-        diffText += "**Added:**\n```\n" + added.slice(0, 20).join("\n") + "\n```\n\n";
+      if (blocks.length > 0) {
+        const { result: patched, applied, failed } = applySearchReplace(code, blocks);
+        newCode = patched;
+        diffText += `${applied.length} change(s) applied`;
+        if (failed.length > 0) diffText += `, ${failed.length} failed to match`;
+        diffText += "\n\n";
+
+        for (const b of applied) {
+          if (b.search.trim()) diffText += `**Removed:**\n\`\`\`\n${b.search.split("\n").slice(0, 10).join("\n")}\n\`\`\`\n\n`;
+          if (b.replace.trim()) diffText += `**Added:**\n\`\`\`\n${b.replace.split("\n").slice(0, 10).join("\n")}\n\`\`\`\n\n`;
+          else diffText += `*(deleted)*\n\n`;
+        }
+
+        if (applied.length === 0) {
+          diffText += "Could not match SEARCH blocks. Retrying with full-file mode...\n\n";
+        }
       }
 
-      if (added.length === 0 && removed.length === 0) {
-        return {
-          content: [{ type: "text", text: `No changes needed for ${file_path}.` }],
-        };
+      // Fallback to full-file if no blocks or none applied
+      if (blocks.length === 0 || (blocks.length > 0 && !parseSearchReplace(result.text).some(b => code.includes(b.search)))) {
+        const ffPrompt = `TASK: Edit a file. Return the COMPLETE updated file.
+
+FILE: ${file_path} (${lang})
+CURRENT FILE CONTENT:
+\`\`\`${lang}
+${code}
+\`\`\`
+
+INSTRUCTION: ${instruction}
+
+Return the ENTIRE file with changes inside a code block. Do NOT truncate.`;
+
+        const ffResult = await askAI(ffPrompt);
+        newCode = extractCodeBlock(ffResult.text);
+        diffText = `**Edit: ${file_path}** [${ffResult.provider}] (full-file mode)\n\n`;
+
+        const oldSet = new Set(code.split("\n"));
+        const newSet = new Set(newCode.split("\n"));
+        const added = newCode.split("\n").filter(l => !oldSet.has(l));
+        const removed = code.split("\n").filter(l => !newSet.has(l));
+        if (removed.length > 0) diffText += `**Removed:**\n\`\`\`\n${removed.slice(0, 15).join("\n")}\n\`\`\`\n\n`;
+        if (added.length > 0) diffText += `**Added:**\n\`\`\`\n${added.slice(0, 15).join("\n")}\n\`\`\`\n\n`;
+      }
+
+      if (newCode === code) {
+        return { content: [{ type: "text", text: `No changes needed for ${file_path}.` }] };
       }
 
       if (auto_apply) {
         writeFileSync(resolved, newCode);
         diffText += `✓ Changes saved to ${file_path}`;
       } else {
-        diffText += `Changes NOT applied (auto_apply=false). Review the diff above.`;
+        diffText += `Changes NOT applied (auto_apply=false).`;
       }
 
       return { content: [{ type: "text", text: diffText }] };
@@ -382,6 +461,33 @@ server.tool(
         },
       ],
     };
+  }
+);
+
+server.tool(
+  "run_command",
+  "Run a shell command and return the output. Useful for running tests, git commands, build tools, etc.",
+  {
+    command: z.string().describe("Shell command to execute"),
+    cwd: z.string().optional().describe("Working directory (default: current directory)"),
+  },
+  async ({ command, cwd }) => {
+    try {
+      const { execSync } = await import("child_process");
+      const output = execSync(command, {
+        encoding: "utf-8",
+        timeout: 30000,
+        cwd: cwd || process.cwd(),
+      });
+      return {
+        content: [{ type: "text", text: `\`$ ${command}\`\n\n\`\`\`\n${output}\n\`\`\`` }],
+      };
+    } catch (err) {
+      let text = `\`$ ${command}\`\n\nError: ${err.message}`;
+      if (err.stdout) text += `\n\nstdout:\n\`\`\`\n${err.stdout}\n\`\`\``;
+      if (err.stderr) text += `\n\nstderr:\n\`\`\`\n${err.stderr}\n\`\`\``;
+      return { content: [{ type: "text", text }], isError: true };
+    }
   }
 );
 

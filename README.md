@@ -1,17 +1,18 @@
 # free-ai-mcp
 
-Free AI coding agent that can **read, edit, review, and generate code** — powered by multiple free AI APIs with automatic fallback. When one provider hits its rate limit, the next one takes over seamlessly.
+Free AI coding agent that works like Claude Code — **read, edit, review, and generate code** using free AI APIs with automatic fallback. When one provider hits its rate limit, the next one takes over.
 
-Works as both a **CLI tool** (use directly in terminal) and an **MCP server** (use inside Claude Code, Cursor, etc.).
+Works as both a **CLI tool** (interactive terminal agent) and an **MCP server** (use inside Claude Code, Cursor, etc.).
 
 ## Features
 
-- **Edit files** — AI reads your file, applies changes, shows diff, and saves
-- **Generate files** — Create new files from instructions
-- **Review code** — Get a code review for bugs, security, and best practices
-- **Explain code** — Understand any file in your project
-- **Ask questions** — Ask coding questions with optional file context
+- **Search/Replace editing** — AI returns precise SEARCH/REPLACE blocks (like Claude Code), not entire files. Much more reliable for code changes, especially removals.
+- **Shell commands** — Run any shell command with `!` prefix or `run` command
+- **Git integration** — Type `git status`, `git diff`, etc. directly
+- **Undo** — Revert the last edit with `/undo`
+- **Natural language** — Say "add validation to app/models/user.rb" and it detects the edit intent
 - **Auto-fallback** — If one AI provider is rate-limited, the next one is tried automatically
+- **Project-aware** — Scans your project structure for context
 
 ## Supported Providers (All Free)
 
@@ -54,46 +55,74 @@ GEMINI_API_KEY=your_gemini_key_here
 GROQ_API_KEY=your_groq_key_here
 ```
 
-## Usage — CLI (Direct)
+## Usage — Interactive Mode (like Claude Code)
 
-### Edit a file with AI
+Start the agent in your project directory:
 
 ```bash
-node src/cli.js edit app/models/user.rb "add email validation"
-node src/cli.js edit src/index.js "add error handling to the fetch call"
+cd your-project
+free-ai
 ```
 
-The AI reads the file, applies your instruction, shows a diff, and asks for confirmation before saving.
+Then type naturally:
 
-### Generate a new file
-
-```bash
-node src/cli.js generate app/models/invoice.rb "Rails model with validations for invoice"
+### Edit files
+```
+edit app/models/user.rb add email validation
+add pagination to app/controllers/products_controller.rb
+remove the header from app/views/layouts/application.html.erb
+fix the N+1 query in app/models/order.rb
 ```
 
-### Explain a file
-
-```bash
-node src/cli.js explain app/controllers/sales_controller.rb
+### Read & explore
+```
+read app/models/product.rb
+explain app/controllers/sales_controller.rb
+review app/views/sales/_form.html.erb
+ls app/models
+scan app/controllers
 ```
 
-### Review a code file
-
-```bash
-node src/cli.js review app/views/sales/_form.html.erb
+### Create files
+```
+create app/services/stock_alert.rb service that checks low stock
 ```
 
-### Ask a coding question
-
-```bash
-node src/cli.js ask "how to add pagination in Rails"
-node src/cli.js ask -f app/models/user.rb "optimize this model"
+### Shell & Git
+```
+!bundle exec rails test
+run npm install
+git status
+git diff
+git log --oneline -5
 ```
 
-### Check provider status
+### Ask questions
+```
+what is the best way to add pagination in Rails?
+how does the auth flow work in this project?
+```
+
+### Commands
+| Command | Description |
+|---|---|
+| `/scan` | Scan project structure |
+| `/ls [dir]` | List files in a directory |
+| `/status` | Show provider status |
+| `/undo` | Undo last file edit |
+| `/help` | Show help |
+| `/clear` | Clear conversation |
+| `/exit` | Exit chat |
+
+## Usage — One-shot CLI
 
 ```bash
-node src/cli.js status
+free-ai edit app/models/user.rb "add email validation"
+free-ai explain app/controllers/sales_controller.rb
+free-ai review app/views/sales/_form.html.erb
+free-ai generate app/models/invoice.rb "Rails model with validations"
+free-ai ask "how to add pagination in Rails"
+free-ai status
 ```
 
 ## Usage — MCP Server (Claude Code / Cursor)
@@ -106,17 +135,36 @@ claude mcp add free-ai node /full/path/to/free-ai-mcp/src/mcp-server.js
 
 ### Available MCP tools
 
-Once added, you get these tools:
-
 | Tool | Description |
 |---|---|
-| **edit_code** | Read a file, edit it with AI, and save changes |
+| **edit_code** | Edit files with SEARCH/REPLACE blocks |
 | **read_code** | Read a file with line numbers |
 | **generate_code** | Generate a new file from instructions |
 | **explain_code** | Get an AI explanation of a file |
-| **review_code** | Review a file for bugs, security, and improvements |
+| **review_code** | Review for bugs, security, and improvements |
 | **ask_ai** | Ask a coding question |
+| **run_command** | Run a shell command |
 | **ai_status** | Check configured providers |
+
+## How the edit engine works
+
+The edit engine uses **SEARCH/REPLACE blocks** (the same approach Claude Code uses):
+
+```
+<<<<<<< SEARCH
+exact lines from the original file
+=======
+replacement lines (or empty to delete)
+>>>>>>> REPLACE
+```
+
+This is much more reliable than asking the AI to return the entire file because:
+- The AI only outputs the changed parts, not the whole file
+- No risk of truncation on large files
+- Deletions work reliably (empty REPLACE = remove)
+- Multiple changes can be made in one pass
+
+If the AI doesn't return SEARCH/REPLACE blocks, it automatically falls back to full-file mode.
 
 ## How fallback works
 
@@ -142,12 +190,12 @@ You ask a question
   Error: All providers exhausted
 ```
 
-Providers are tried in the order listed. Add more API keys = more fallback options = more free usage.
-
 ## Tips
 
 - Add all 5 provider keys to maximize your free AI usage across the day
 - Gemini has the most generous free tier (1M tokens/day)
 - Groq is the fastest (responses in <1 second)
 - The `edit` command always shows a diff and asks for confirmation before saving
-- Use `explain` before `edit` if you want to understand a file first
+- Use `!` to run any shell command without leaving the agent
+- Use `/undo` if an edit didn't turn out right
+- Type `git status` or `git diff` to check your changes
