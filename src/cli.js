@@ -5,6 +5,8 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSy
 import { resolve, join, extname, basename, dirname, relative } from "path";
 import { createInterface } from "readline";
 
+const { execSync } = await import("child_process");
+
 const args = process.argv.slice(2);
 const command = args[0];
 
@@ -29,22 +31,29 @@ Interactive mode — type naturally:
     "edit app/models/user.rb add email validation"
     "add pagination to app/controllers/products_controller.rb"
     "remove the header from app/views/layouts/application.html.erb"
-    "fix the N+1 query in app/models/order.rb"
 
-  Read/explore:
-    "read app/models/product.rb"
-    "explain app/controllers/sales_controller.rb"
-    "review app/views/sales/_form.html.erb"
-    "ls app/models"  or  "scan app/controllers"
+  Multi-file edits:
+    "add a name column to users"     Plans & edits migration + model + views
+    "add a search feature"           AI plans which files to create/edit
 
-  Create files:
-    "create app/services/stock_alert.rb service that checks low stock"
+  Auto-fix:
+    fix                              Runs tests, reads errors, fixes code
+    fix bundle exec rails test       Custom test command
+    fix npm test                     Works with any test runner
+
+  Search & explore:
+    grep validates app/models        Search for text across files
+    search "def create"              Same as grep
+    find TODO                        Find all TODOs in project
+    read app/models/product.rb       Read file with line numbers
+    ls app/models                    List directory
+    scan app/controllers             Deep scan directory
 
   Shell & Git:
-    !bundle exec rails test           Run any shell command
-    run npm install                    Same as ! prefix
-    git status                         Git commands run directly
-    git diff                           View changes
+    !bundle exec rails test          Run any shell command
+    run npm install                   Same as ! prefix
+    git status                        Git commands run directly
+    commit                            AI writes commit message, you confirm
 
   Ask questions:
     "what is the best way to add pagination in Rails?"
@@ -52,12 +61,18 @@ Interactive mode — type naturally:
 
   Commands:
     /scan      Scan project structure
-    /ls [dir]  List files in a directory
+    /ls [dir]  List files
+    /grep      Search across files
     /status    Show provider status
     /undo      Undo last file edit
+    /diff      Show session changes & git diff
+    /commit    Smart commit with AI message
     /help      Show help
     /clear     Clear conversation
     /exit      Exit chat
+
+Project memory: Create .free-ai.md in your project root with instructions
+  like "This is a Rails 8 app using Tailwind v4" and the AI will use it.
 
 Edit engine uses SEARCH/REPLACE blocks (like Claude Code) for precise changes.
 Providers are tried in order. If one is rate-limited, the next is used.
@@ -306,20 +321,491 @@ function doLs(dirPath) {
   }
 }
 
+// --- Project memory (.free-ai.md) ---
+
+function loadProjectMemory() {
+  const paths = [
+    join(process.cwd(), ".free-ai.md"),
+    join(process.cwd(), ".free-ai"),
+    join(process.env.HOME || "", ".free-ai.md"),
+  ];
+  for (const p of paths) {
+    if (existsSync(p) && !statSync(p).isDirectory()) {
+      try {
+        return readFileSync(p, "utf-8").trim();
+      } catch { }
+    }
+  }
+  return null;
+}
+
+const projectMemory = loadProjectMemory();
+
+// --- Session tracking ---
+
+const sessionEdits = [];
+const sessionReads = new Set();
+
+function trackEdit(filePath) {
+  sessionEdits.push({ file: filePath, time: new Date().toLocaleTimeString() });
+}
+
+function trackRead(filePath) {
+  sessionReads.add(filePath);
+}
+
+function getRecentContext() {
+  const parts = [];
+  if (sessionEdits.length > 0) {
+    parts.push(`Recently edited: ${sessionEdits.slice(-5).map(e => e.file).join(", ")}`);
+  }
+  if (sessionReads.size > 0) {
+    parts.push(`Recently read: ${[...sessionReads].slice(-5).join(", ")}`);
+  }
+  return parts.join("\n");
+}
+
 // --- Shell command execution ---
 
-async function doRun(cmd) {
-  const { execSync } = await import("child_process");
+function doRun(cmd) {
   printColored(`  $ ${cmd}\n\n`, "dim");
   try {
-    const output = execSync(cmd, { encoding: "utf-8", timeout: 30000, cwd: process.cwd() });
+    const output = execSync(cmd, { encoding: "utf-8", timeout: 60000, cwd: process.cwd() });
     if (output.trim()) console.log(output);
     return output;
   } catch (err) {
-    printColored(`  Error: ${err.message}\n`, "red");
-    if (err.stdout) console.log(err.stdout);
-    if (err.stderr) printColored(`  ${err.stderr}\n`, "red");
+    const errOutput = (err.stdout || "") + (err.stderr || "");
+    if (errOutput.trim()) console.log(errOutput);
+    else printColored(`  Exit code: ${err.status}\n`, "red");
+    return errOutput || null;
+  }
+}
+
+// --- Grep / Search ---
+
+function doGrep(pattern, searchPath) {
+  const dir = resolve(expandPath(searchPath || "."));
+  if (!existsSync(dir)) {
+    printColored(`Path not found: ${dir}\n`, "red");
     return null;
+  }
+
+  printColored(`  Searching for "${pattern}" in ${searchPath || "."}...\n\n`, "dim");
+
+  try {
+    const output = execSync(
+      `grep -rn --include='*.rb' --include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' --include='*.py' --include='*.go' --include='*.java' --include='*.erb' --include='*.html' --include='*.css' --include='*.yml' --include='*.yaml' --include='*.json' --include='*.vue' --include='*.svelte' --include='*.sql' --include='*.sh' --color=never "${pattern.replace(/"/g, '\\"')}" "${dir}" 2>/dev/null || true`,
+      { encoding: "utf-8", timeout: 15000 }
+    );
+
+    if (!output.trim()) {
+      printColored(`  No results found for "${pattern}"\n\n`, "yellow");
+      return null;
+    }
+
+    const lines = output.trim().split("\n");
+    const cwd = process.cwd();
+    let shown = 0;
+    for (const line of lines) {
+      if (shown >= 50) {
+        printColored(`  ... and ${lines.length - 50} more results\n`, "dim");
+        break;
+      }
+      const display = line.startsWith(cwd) ? line.slice(cwd.length + 1) : line;
+      const colonIdx = display.indexOf(":");
+      const secondColon = display.indexOf(":", colonIdx + 1);
+      if (colonIdx > 0 && secondColon > 0) {
+        printColored(`  ${display.slice(0, secondColon)}`, "cyan");
+        console.log(display.slice(secondColon));
+      } else {
+        console.log(`  ${display}`);
+      }
+      shown++;
+    }
+    console.log();
+    printColored(`  ${lines.length} result(s)\n\n`, "dim");
+    return output;
+  } catch {
+    printColored("  Search failed.\n\n", "red");
+    return null;
+  }
+}
+
+// --- Diff (session changes) ---
+
+function doDiff(filePath) {
+  if (filePath) {
+    printColored(`  Changes to ${filePath}:\n\n`, "bold");
+    try {
+      const output = execSync(`git diff "${resolve(expandPath(filePath))}" 2>/dev/null || true`, { encoding: "utf-8" });
+      if (output.trim()) {
+        for (const line of output.split("\n")) {
+          if (line.startsWith("+") && !line.startsWith("+++")) printColored(`  ${line}\n`, "green");
+          else if (line.startsWith("-") && !line.startsWith("---")) printColored(`  ${line}\n`, "red");
+          else printColored(`  ${line}\n`, "dim");
+        }
+      } else {
+        printColored("  No uncommitted changes.\n", "dim");
+      }
+    } catch {
+      printColored("  Not a git repo or git not available.\n", "yellow");
+    }
+  } else {
+    printColored("  Session changes:\n\n", "bold");
+    if (sessionEdits.length === 0) {
+      printColored("  No files edited this session.\n", "dim");
+    } else {
+      for (const e of sessionEdits) {
+        printColored(`  ${e.time}  `, "dim");
+        printColored(`${e.file}\n`, "cyan");
+      }
+    }
+    console.log();
+    try {
+      const output = execSync("git diff --stat 2>/dev/null || true", { encoding: "utf-8" });
+      if (output.trim()) {
+        printColored("  Git diff:\n", "bold");
+        console.log(output);
+      }
+    } catch { }
+  }
+  console.log();
+}
+
+// --- Smart commit ---
+
+async function doCommit() {
+  printColored("  Checking changes...\n\n", "dim");
+
+  let diffOutput;
+  try {
+    diffOutput = execSync("git diff --cached --stat 2>/dev/null", { encoding: "utf-8" });
+    if (!diffOutput.trim()) {
+      execSync("git add -A", { encoding: "utf-8" });
+      diffOutput = execSync("git diff --cached --stat 2>/dev/null", { encoding: "utf-8" });
+    }
+  } catch {
+    printColored("  Not a git repo.\n\n", "red");
+    return;
+  }
+
+  if (!diffOutput.trim()) {
+    printColored("  Nothing to commit.\n\n", "yellow");
+    return;
+  }
+
+  printColored("  Staged:\n", "bold");
+  console.log(diffOutput);
+
+  let diffDetail;
+  try {
+    diffDetail = execSync("git diff --cached 2>/dev/null", { encoding: "utf-8" });
+  } catch { diffDetail = ""; }
+
+  const truncatedDiff = diffDetail.length > 8000 ? diffDetail.slice(0, 8000) + "\n... (truncated)" : diffDetail;
+
+  const prompt = `Generate a git commit message for these changes.
+
+${truncatedDiff}
+
+Rules:
+1. First line: concise summary under 72 chars (imperative mood: "Add...", "Fix...", "Update...")
+2. If needed, add a blank line then 1-2 bullet points explaining WHY
+3. Return ONLY the commit message, nothing else — no code blocks, no explanation`;
+
+  printColored("  Generating commit message...\n\n", "dim");
+
+  try {
+    const result = await askAI(prompt);
+    let msg = result.text.trim();
+    // Strip code blocks if AI wrapped it
+    msg = msg.replace(/^```[\w]*\n?/, "").replace(/\n?```$/, "").trim();
+
+    printColored(`  [${result.provider}]\n\n`, "cyan");
+    printColored("  Commit message:\n", "bold");
+    for (const line of msg.split("\n")) {
+      printColored(`  ${line}\n`, "green");
+    }
+    console.log();
+
+    const ok = await confirm("  Commit with this message? (y/n) ");
+    if (ok) {
+      try {
+        execSync(`git commit -m ${JSON.stringify(msg)}`, { encoding: "utf-8" });
+        printColored("\n  ✓ Committed.\n\n", "green");
+      } catch (err) {
+        printColored(`\n  Commit failed: ${err.message}\n\n`, "red");
+      }
+    } else {
+      printColored("\n  ✗ Commit cancelled.\n\n", "yellow");
+      execSync("git reset HEAD 2>/dev/null || true", { encoding: "utf-8" });
+    }
+  } catch (err) {
+    printColored(`Error: ${err.message}\n`, "red");
+  }
+}
+
+// --- Auto-fix loop ---
+
+async function doFix(testCmd) {
+  const cmd = testCmd || detectTestCommand();
+  if (!cmd) {
+    printColored("  Could not detect test command. Usage: fix <test command>\n", "yellow");
+    printColored("  Examples: fix bundle exec rails test, fix npm test, fix pytest\n\n", "dim");
+    return;
+  }
+
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    printColored(`\n  Attempt ${attempt}/${MAX_ATTEMPTS}: Running tests...\n\n`, "bold");
+    const output = doRun(cmd);
+
+    if (!output || output.trim() === "") {
+      printColored("  ✓ Tests passed (no output).\n\n", "green");
+      return;
+    }
+
+    // Check if tests passed
+    const lower = output.toLowerCase();
+    const passed = (lower.includes("0 failures") && lower.includes("0 errors")) ||
+      lower.includes("all tests passed") ||
+      lower.includes("tests passed") ||
+      (lower.includes("passing") && !lower.includes("failing")) ||
+      /\b0 failed\b/.test(lower) ||
+      (/passed/.test(lower) && !/failed|error|failure/i.test(lower));
+
+    if (passed) {
+      printColored("  ✓ All tests passing!\n\n", "green");
+      return;
+    }
+
+    printColored(`\n  Tests failed. Asking AI to fix...\n\n`, "yellow");
+
+    // Get project context
+    const projectTree = scanDir(".", "", 2);
+    const treeContext = projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n");
+
+    // Truncate test output
+    const truncatedOutput = output.length > 6000 ? output.slice(-6000) : output;
+
+    const prompt = `Test command "${cmd}" failed with this output:
+
+\`\`\`
+${truncatedOutput}
+\`\`\`
+
+Project structure:
+${treeContext}
+
+${projectMemory ? `Project context:\n${projectMemory}\n` : ""}
+
+Analyze the error and tell me:
+1. Which file(s) need to be fixed (give exact paths)
+2. What specific change is needed in each file
+
+For each file, provide SEARCH/REPLACE blocks:
+
+<<<<<<< SEARCH
+exact lines from the file
+=======
+fixed replacement
+>>>>>>> REPLACE
+
+If you need to see a file's content first, say "NEED_FILE: <path>" and I'll show it.`;
+
+    try {
+      const result = await askAI(prompt);
+      printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+
+      // Check if AI needs to see files
+      const needFiles = [...result.text.matchAll(/NEED_FILE:\s*(\S+)/g)];
+      if (needFiles.length > 0) {
+        let fileContext = "";
+        for (const [, path] of needFiles) {
+          const content = readFile(path);
+          if (content) {
+            fileContext += `\n--- ${path} ---\n\`\`\`\n${content}\n\`\`\`\n`;
+          }
+        }
+
+        const followUp = `Here are the files you requested:\n${fileContext}\n\nNow provide the SEARCH/REPLACE fixes.`;
+        const result2 = await askAI(followUp, { context: [
+          { role: "user", content: prompt },
+          { role: "assistant", content: result.text },
+        ]});
+        await applyAIFixes(result2.text);
+      } else {
+        await applyAIFixes(result.text);
+      }
+    } catch (err) {
+      printColored(`  Error: ${err.message}\n\n`, "red");
+      return;
+    }
+  }
+
+  printColored(`  Reached max attempts (${MAX_ATTEMPTS}). Some tests may still be failing.\n\n`, "yellow");
+}
+
+function detectTestCommand() {
+  if (existsSync("Gemfile")) return "bundle exec rails test";
+  if (existsSync("package.json")) {
+    try {
+      const pkg = JSON.parse(readFileSync("package.json", "utf-8"));
+      if (pkg.scripts?.test) return "npm test";
+    } catch { }
+  }
+  if (existsSync("pytest.ini") || existsSync("setup.py") || existsSync("pyproject.toml")) return "pytest";
+  if (existsSync("go.mod")) return "go test ./...";
+  if (existsSync("Cargo.toml")) return "cargo test";
+  return null;
+}
+
+async function applyAIFixes(text) {
+  // Extract file paths and their search/replace blocks
+  const fileBlocks = {};
+  let currentFile = null;
+
+  // Try to detect file paths mentioned before search/replace blocks
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const fileMatch = lines[i].match(/(?:File|file|In|in|Edit|edit)[:\s]+[`"']?([^\s`"']+\.\w+)[`"']?/);
+    if (fileMatch) currentFile = fileMatch[1];
+
+    if (lines[i].includes("<<<<<<< SEARCH") && currentFile) {
+      if (!fileBlocks[currentFile]) fileBlocks[currentFile] = [];
+    }
+  }
+
+  // Parse all blocks
+  const allBlocks = parseSearchReplace(text);
+
+  if (allBlocks.length === 0) {
+    console.log(text);
+    return;
+  }
+
+  // Try to match blocks to files by searching for the search text
+  for (const block of allBlocks) {
+    let matched = false;
+    // Check all project files for this block's search text
+    const entries = scanDir(".", "", 3);
+    const files = entries.filter(e => e.type === "file" && e.size < 100000);
+
+    for (const f of files) {
+      try {
+        const content = readFileSync(resolve(f.path), "utf-8");
+        if (content.includes(block.search)) {
+          if (!fileBlocks[f.path]) fileBlocks[f.path] = [];
+          fileBlocks[f.path].push(block);
+          matched = true;
+          break;
+        }
+      } catch { }
+    }
+
+    if (!matched) {
+      printColored(`  ⚠ Could not find file for SEARCH block: ${block.search.split("\n")[0].slice(0, 60)}...\n`, "yellow");
+    }
+  }
+
+  // Apply fixes to each file
+  for (const [filePath, blocks] of Object.entries(fileBlocks)) {
+    const code = readFile(filePath);
+    if (!code) continue;
+
+    const { result: newCode, applied, failed } = applySearchReplace(code, blocks);
+
+    if (applied.length === 0) {
+      printColored(`  ⚠ No changes matched in ${filePath}\n`, "yellow");
+      continue;
+    }
+
+    printColored(`  ${filePath}: ${applied.length} fix(es)\n`, "bold");
+    for (const b of applied) {
+      if (b.search.trim()) {
+        printColored(`    - ${b.search.split("\n")[0].slice(0, 60)}\n`, "red");
+      }
+      if (b.replace.trim()) {
+        printColored(`    + ${b.replace.split("\n")[0].slice(0, 60)}\n`, "green");
+      }
+    }
+
+    const ok = await confirm(`  Apply fix to ${filePath}? (y/n) `);
+    if (ok) {
+      saveUndo(filePath, code);
+      writeFileSync(resolve(expandPath(filePath)), newCode);
+      trackEdit(filePath);
+      printColored(`  ✓ Fixed ${filePath}\n`, "green");
+    }
+  }
+  console.log();
+}
+
+// --- Multi-file edit ---
+
+async function doMultiEdit(instruction) {
+  printColored("⏳ Planning multi-file edit...\n\n", "dim");
+
+  const projectTree = scanDir(".", "", 2);
+  const treeContext = projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n");
+
+  const planPrompt = `TASK: Plan a multi-file code change.
+
+Project structure:
+${treeContext}
+
+${projectMemory ? `Project context:\n${projectMemory}\n` : ""}
+${getRecentContext() ? `\n${getRecentContext()}\n` : ""}
+
+INSTRUCTION: ${instruction}
+
+List the files that need to be created or modified. For each file:
+- If it EXISTS, describe what changes are needed
+- If it's NEW, describe what it should contain
+
+Format your response as:
+EDIT: <filepath> — <description of changes>
+CREATE: <filepath> — <description of content>
+
+List ALL files needed, then I'll handle each one.`;
+
+  try {
+    const result = await askAI(planPrompt);
+    printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+    console.log(result.text);
+    console.log();
+
+    // Parse the plan
+    const edits = [...result.text.matchAll(/EDIT:\s*(\S+)\s*[—-]\s*(.+)/g)];
+    const creates = [...result.text.matchAll(/CREATE:\s*(\S+)\s*[—-]\s*(.+)/g)];
+
+    if (edits.length === 0 && creates.length === 0) {
+      printColored("  Could not parse a file plan. Try being more specific.\n\n", "yellow");
+      return;
+    }
+
+    printColored(`  Plan: ${edits.length} edit(s), ${creates.length} new file(s)\n\n`, "bold");
+
+    const ok = await confirm("  Execute this plan? (y/n) ");
+    if (!ok) {
+      printColored("\n  ✗ Plan cancelled.\n\n", "yellow");
+      return;
+    }
+    console.log();
+
+    // Execute edits
+    for (const [, filePath, desc] of edits) {
+      await doEdit(filePath, desc);
+    }
+
+    // Execute creates
+    for (const [, filePath, desc] of creates) {
+      await doGenerate(filePath, desc);
+    }
+
+    printColored("  ✓ Multi-file edit complete.\n\n", "green");
+  } catch (err) {
+    printColored(`Error: ${err.message}\n`, "red");
   }
 }
 
@@ -385,10 +871,12 @@ async function doEdit(filePath, instruction) {
     ? `\nProject structure:\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 40).join("\n")}\n`
     : "";
 
+  const memoryContext = projectMemory ? `\nProject context:\n${projectMemory}\n` : "";
+
   const prompt = `TASK: Edit a file using SEARCH/REPLACE blocks.
 
 FILE: ${filePath} (${lang}, ${lineCount} lines)
-${treeContext}
+${treeContext}${memoryContext}
 CURRENT FILE CONTENT:
 \`\`\`${lang}
 ${code}
@@ -465,6 +953,7 @@ RULES:
       if (ok) {
         saveUndo(filePath, code);
         writeFileSync(resolve(expandPath(filePath)), newCode);
+        trackEdit(filePath);
         printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
       } else {
         printColored("\n  ✗ Changes discarded.\n\n", "yellow");
@@ -543,6 +1032,7 @@ Do NOT truncate, skip, or use placeholders. Every line must be present.`;
       const dir = dirname(resolve(expandPath(filePath)));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(resolve(expandPath(filePath)), newCode);
+      trackEdit(filePath);
       printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
     } else {
       printColored("\n  ✗ Changes discarded.\n\n", "yellow");
@@ -690,6 +1180,7 @@ async function doRead(pathArg) {
   const code = readFile(pathArg);
   if (code === null) return;
 
+  trackRead(pathArg);
   const lang = getLang(pathArg);
   const lines = code.split("\n");
   printColored(`\n  ${pathArg} (${lang}, ${lines.length} lines)\n\n`, "bold");
@@ -760,7 +1251,10 @@ async function doAsk(question, fileContext) {
     : "";
 
   let fullContext = "";
+  if (projectMemory) fullContext += `Project context:\n${projectMemory}\n\n`;
   if (treeSnippet) fullContext += `Project structure:\n${treeSnippet}\n\n`;
+  const recent = getRecentContext();
+  if (recent) fullContext += `${recent}\n\n`;
   if (fileContext) fullContext += `File content:\n\`\`\`\n${fileContext}\n\`\`\`\n\n`;
 
   const prompt = fullContext
@@ -834,10 +1328,14 @@ async function startChat() {
   }
   printColored(`  Providers: ${active.map((p) => p.label).join(", ")}\n`, "dim");
 
+  if (projectMemory) {
+    printColored(`  Memory: .free-ai.md loaded\n`, "green");
+  }
+
   console.log();
-  printColored("  Type naturally — I can read, edit, review, and scan your project.\n", "dim");
-  printColored("  Shell: !<command> or run <command>  |  Git: git status, git diff, etc.\n", "dim");
-  printColored("  Commands: /scan /ls /status /undo /help /clear /exit\n", "dim");
+  printColored("  Type naturally — edit, review, search, fix, commit.\n", "dim");
+  printColored("  Shell: !<cmd>  Git: git status  Search: grep <text>  Tests: fix\n", "dim");
+  printColored("  /help for all commands  |  /exit to quit\n", "dim");
   console.log();
 
   const rl = createInterface({
@@ -887,6 +1385,21 @@ async function startChat() {
       showPrompt();
       return;
     }
+    if (input === "/diff" || input === "diff") {
+      doDiff();
+      showPrompt();
+      return;
+    }
+    if (input.startsWith("/diff ") || input.startsWith("diff ")) {
+      doDiff(input.replace(/^\/?diff\s+/, "").trim());
+      showPrompt();
+      return;
+    }
+    if (input === "/commit" || input === "commit") {
+      await doCommit();
+      showPrompt();
+      return;
+    }
     if (input.startsWith("/scan")) {
       const dir = input.replace("/scan", "").trim() || ".";
       doScan(dir);
@@ -904,19 +1417,42 @@ async function startChat() {
 
     // Shell commands: !<command> or "run <command>"
     if (input.startsWith("!")) {
-      await doRun(input.slice(1).trim());
+      doRun(input.slice(1).trim());
       showPrompt();
       return;
     }
     if (lowerInput.startsWith("run ") && !findPath(input)) {
-      await doRun(input.slice(4).trim());
+      doRun(input.slice(4).trim());
       showPrompt();
       return;
     }
 
     // Git shorthand: "git status", "git diff", etc.
     if (input.startsWith("git ")) {
-      await doRun(input);
+      doRun(input);
+      showPrompt();
+      return;
+    }
+
+    // Grep/search: "grep <pattern> [path]" or "search <pattern> [path]" or "find <pattern> [path]"
+    if (lowerInput.startsWith("grep ") || lowerInput.startsWith("search ") || lowerInput.startsWith("find ")) {
+      const rest = input.replace(/^(?:grep|search|find)\s+/i, "").trim();
+      const parts = rest.split(/\s+/);
+      const pattern = parts[0];
+      const searchPath = parts[1] || ".";
+      if (pattern) {
+        doGrep(pattern, searchPath);
+      } else {
+        printColored('  Usage: grep <pattern> [path]\n\n', "yellow");
+      }
+      showPrompt();
+      return;
+    }
+
+    // Fix command: "fix [test command]"
+    if (lowerInput.startsWith("fix ") || lowerInput === "fix") {
+      const testCmd = input.replace(/^fix\s*/i, "").trim() || null;
+      await doFix(testCmd);
       showPrompt();
       return;
     }
@@ -926,6 +1462,10 @@ async function startChat() {
     // Detect edit intent from natural language
     const editKeywords = /\b(add|remove|delete|change|replace|update|fix|rename|refactor|move|insert|modify|make|set|convert|wrap|unwrap|extract|inline)\b/i;
     const isEditIntent = editKeywords.test(input) && foundPath && isFile(foundPath);
+
+    // Detect multi-file intent (no specific file path, but a broad instruction)
+    const multiFileKeywords = /\b(add a .+ column|add .+ to .+ and|create .+ with .+ migration|scaffold|generate .+ crud|add .+ feature)\b/i;
+    const isMultiFile = multiFileKeywords.test(input) && !foundPath;
 
     // Scan/ls: "scan <dir>" or "ls <dir>"
     if ((lowerInput.startsWith("scan ") || lowerInput.startsWith("ls ")) && foundPath) {
@@ -965,6 +1505,10 @@ async function startChat() {
       } else {
         printColored('  What should the file contain? e.g., create app/models/invoice.rb "model with validations"\n\n', "yellow");
       }
+    }
+    // Multi-file edit: broad instructions without a specific file
+    else if (isMultiFile) {
+      await doMultiEdit(input);
     }
     // Natural language edit: "add validation to app/models/user.rb", "remove the header from app/views/..."
     else if (isEditIntent) {
