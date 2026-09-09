@@ -9,13 +9,30 @@ import { homedir } from "os";
 const { execSync } = await import("child_process");
 
 const args = process.argv.slice(2);
-const command = args[0];
+
+// If first arg is a directory path, use it as the project directory
+let command = args[0];
+if (command && !["chat","ask","edit","explain","review","generate","scan","status","help","--help","-h"].includes(command)) {
+  const tryPath = resolve(expandPathEarly(command));
+  if (existsSync(tryPath) && statSync(tryPath).isDirectory()) {
+    process.chdir(tryPath);
+    command = args[1] || undefined;
+  }
+}
+
+function expandPathEarly(p) {
+  if (p && p.startsWith("~")) {
+    return p.replace("~", process.env.HOME || "/Users/" + process.env.USER);
+  }
+  return p || "";
+}
 
 const HELP = `
 free-ai — Free AI coding agent (like Claude Code, but free)
 
 Usage:
-  free-ai                                Start interactive chat mode
+  free-ai                                Start in current directory
+  free-ai <project-path>                 Start in a specific project
   free-ai chat                           Start interactive chat mode
   free-ai ask "your question here"       Ask a coding question
   free-ai ask -f <file> "question"       Ask with file context
