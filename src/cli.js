@@ -984,11 +984,13 @@ async function doEdit(filePath, instruction) {
     : "";
 
   const memoryContext = projectMemory ? `\nProject context:\n${projectMemory}\n` : "";
+  const historyContext = getHistoryContext();
+  const conversationCtx = historyContext ? `\nRecent conversation:\n${historyContext}\n` : "";
 
   const prompt = `TASK: Edit a file using SEARCH/REPLACE blocks.
 
 FILE: ${filePath} (${lang}, ${lineCount} lines)
-${treeContext}${memoryContext}
+${treeContext}${memoryContext}${conversationCtx}
 CURRENT FILE CONTENT:
 \`\`\`${lang}
 ${code}
@@ -1066,6 +1068,7 @@ RULES:
         saveUndo(filePath, code);
         writeFileSync(resolve(expandPath(filePath)), newCode);
         trackEdit(filePath);
+        addToHistory(`Edit ${filePath}: ${instruction}`, `Applied ${applied.length} change(s) to ${filePath}`);
         printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
       } else {
         printColored("\n  ✗ Changes discarded.\n\n", "yellow");
@@ -1182,6 +1185,7 @@ Do NOT truncate, skip, or use placeholders. Every line must be present.`;
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(resolve(expandPath(filePath)), newCode);
       trackEdit(filePath);
+      addToHistory(`Edit ${filePath}: ${instruction}`, `Applied changes to ${filePath} (full-file mode)`);
       printColored(`\n  ✓ Saved ${filePath}\n\n`, "green");
     } else {
       printColored("\n  ✗ Changes discarded.\n\n", "yellow");
@@ -1225,8 +1229,10 @@ Be concise.`;
   const code = readFile(filePath);
   if (code === null) return;
 
+  trackRead(filePath);
   const lang = getLang(filePath);
-  const prompt = `Explain the following ${lang} code from file "${filePath}". Cover:
+  const histCtx = getHistoryContext();
+  const prompt = `${histCtx ? `Recent conversation:\n${histCtx}\n\n` : ""}Explain the following ${lang} code from file "${filePath}". Cover:
 1. What the file does (purpose)
 2. Key functions/methods and what they do
 3. Important patterns or design decisions
@@ -1240,10 +1246,10 @@ ${code}
   printColored(`⏳ Explaining ${filePath}...\n\n`, "dim");
 
   try {
-    const result = await askAI(prompt);
+    const result = await askAI(prompt, { context: chatHistory, onToken: (t) => process.stdout.write(t) });
+    console.log("\n");
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
-    console.log(result.text);
-    console.log();
+    addToHistory(`Explain ${filePath}`, result.text.slice(0, 300));
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
   }
@@ -1295,8 +1301,10 @@ ${allCode}`;
   const code = readFile(filePath);
   if (code === null) return;
 
+  trackRead(filePath);
   const lang = getLang(filePath);
-  const prompt = `Review the following ${lang} code from file "${filePath}". Check for:
+  const histCtx = getHistoryContext();
+  const prompt = `${histCtx ? `Recent conversation:\n${histCtx}\n\n` : ""}Review the following ${lang} code from file "${filePath}". Check for:
 1. Bugs or logic errors
 2. Security vulnerabilities
 3. Performance issues
@@ -1311,10 +1319,10 @@ ${code}
   printColored(`⏳ Reviewing ${filePath}...\n\n`, "dim");
 
   try {
-    const result = await askAI(prompt);
+    const result = await askAI(prompt, { context: chatHistory, onToken: (t) => process.stdout.write(t) });
+    console.log("\n");
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
-    console.log(result.text);
-    console.log();
+    addToHistory(`Review ${filePath}`, result.text.slice(0, 300));
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
   }
@@ -1354,8 +1362,10 @@ async function doGenerate(filePath, instruction) {
     ? `\nProject structure:\n${projectTree.map(e => e.type === "dir" ? e.path + "/" : e.path).slice(0, 50).join("\n")}\n`
     : "";
 
+  const histCtx = getHistoryContext();
+  const memCtx = projectMemory ? `\nProject context:\n${projectMemory}\n` : "";
   const prompt = `Generate the content for a new ${lang} file at "${filePath}" in this project.
-${treeContext}
+${treeContext}${memCtx}${histCtx ? `\nRecent conversation:\n${histCtx}\n` : ""}
 Instruction: ${instruction}
 
 Follow the patterns and conventions used in the existing project files.
@@ -1364,7 +1374,7 @@ Return ONLY the file content inside a single code block. No explanations before 
   printColored(`⏳ Generating ${filePath}...\n\n`, "dim");
 
   try {
-    const result = await askAI(prompt);
+    const result = await askAI(prompt, { context: chatHistory });
     const newCode = extractCodeBlock(result.text);
 
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
@@ -1383,6 +1393,7 @@ Return ONLY the file content inside a single code block. No explanations before 
       const dir = dirname(resolve(expandPath(filePath)));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(resolve(expandPath(filePath)), newCode);
+      addToHistory(`Create ${filePath}: ${instruction}`, `Created ${filePath} (${lines.length} lines)`);
       printColored(`\n  ✓ Created ${filePath}\n\n`, "green");
     } else {
       printColored("\n  ✗ File not created.\n\n", "yellow");
@@ -1422,13 +1433,7 @@ async function doAsk(question, fileContext, imageParts) {
     console.log("\n");
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
 
-    chatHistory.push({ role: "user", content: question });
-    chatHistory.push({ role: "assistant", content: result.text });
-
-    if (chatHistory.length > 20) {
-      chatHistory = chatHistory.slice(-14);
-    }
-    saveChatHistory(chatHistory);
+    addToHistory(question, result.text);
   } catch (err) {
     printColored(`\nError: ${err.message}\n`, "red");
   }
@@ -1436,6 +1441,23 @@ async function doAsk(question, fileContext, imageParts) {
 
 // --- Conversation history ---
 let chatHistory = loadChatHistory();
+
+function addToHistory(userMsg, assistantMsg) {
+  chatHistory.push({ role: "user", content: userMsg });
+  chatHistory.push({ role: "assistant", content: assistantMsg });
+  // Keep last 30 messages (15 exchanges) for better memory
+  if (chatHistory.length > 30) {
+    chatHistory = chatHistory.slice(-24);
+  }
+  saveChatHistory(chatHistory);
+}
+
+function getHistoryContext() {
+  // Return a compact summary of recent history for non-chat AI calls
+  if (chatHistory.length === 0) return "";
+  const recent = chatHistory.slice(-10);
+  return recent.map(m => `${m.role}: ${m.content.slice(0, 200)}`).join("\n");
+}
 
 // --- Undo stack ---
 let undoStack = [];
