@@ -2,7 +2,7 @@
 
 import { askAI, getProviderStatus } from "./router.js";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "fs";
-import { resolve, join, extname } from "path";
+import { resolve, join, extname, basename, dirname } from "path";
 import { createInterface } from "readline";
 
 const args = process.argv.slice(2);
@@ -12,6 +12,8 @@ const HELP = `
 free-ai — Free AI coding agent with file read/edit capabilities
 
 Usage:
+  free-ai                                Start interactive chat mode
+  free-ai chat                           Start interactive chat mode
   free-ai ask "your question here"       Ask a coding question
   free-ai ask -f <file> "question"       Ask with file context
   free-ai edit <file> "instruction"      Edit a file with AI
@@ -21,13 +23,19 @@ Usage:
   free-ai status                         Show configured providers
   free-ai help                           Show this help
 
-Examples:
-  free-ai ask "how to add pagination in Rails"
-  free-ai edit app/models/user.rb "add email validation"
-  free-ai edit src/index.js "add error handling to the fetch call"
-  free-ai explain app/controllers/sales_controller.rb
-  free-ai review app/views/sales/_form.html.erb
-  free-ai generate app/models/invoice.rb "Rails model with validations for invoice"
+Interactive mode commands:
+  Just type naturally:
+    "edit app/models/user.rb add email validation"
+    "explain app/controllers/sales_controller.rb"
+    "review app/views/sales/_form.html.erb"
+    "create app/services/stock_alert.rb service that checks low stock"
+    "read app/models/product.rb"
+    "what is the best way to add pagination in Rails?"
+
+  Special commands:
+    /status    Show provider status
+    /help      Show help
+    /exit      Exit chat
 
 Providers are tried in order. If one is rate-limited, the next is used.
 Configure API keys in: .env file
@@ -74,13 +82,13 @@ function readFile(filePath) {
   const resolved = resolve(filePath);
   if (!existsSync(resolved)) {
     printColored(`File not found: ${filePath}\n`, "red");
-    process.exit(1);
+    return null;
   }
   try {
     return readFileSync(resolved, "utf-8");
   } catch {
     printColored(`Cannot read file: ${filePath}\n`, "red");
-    process.exit(1);
+    return null;
   }
 }
 
@@ -98,58 +106,25 @@ function extractCodeBlock(text) {
   return text;
 }
 
-// --- Commands ---
-
-async function handleAsk() {
-  let fileContent = null;
-  let question = null;
-  const askArgs = args.slice(1);
-
-  for (let i = 0; i < askArgs.length; i++) {
-    if (askArgs[i] === "-f" && askArgs[i + 1]) {
-      fileContent = readFile(askArgs[i + 1]);
-      i++;
-    } else {
-      question = askArgs[i];
-    }
+function findFilePath(input) {
+  const patterns = [
+    /(?:^|\s)([\w./-]+\.(?:rb|js|ts|py|jsx|tsx|erb|html|css|sql|yml|yaml|json|go|rs|java|vue|svelte|sh|rake|md))\b/,
+    /(?:^|\s)([\w./-]+\/[\w.-]+)\b/,
+  ];
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    if (match) return match[1];
   }
-
-  if (!question) {
-    printColored("Please provide a question.\n", "red");
-    printColored('Usage: free-ai ask "your question"\n', "dim");
-    process.exit(1);
-  }
-
-  const prompt = fileContent
-    ? `Context:\n\`\`\`\n${fileContent}\n\`\`\`\n\nQuestion: ${question}`
-    : question;
-
-  printColored("⏳ Asking free AI...\n\n", "dim");
-
-  try {
-    const result = await askAI(prompt);
-    printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
-    console.log(result.text);
-    console.log();
-  } catch (err) {
-    printColored(`Error: ${err.message}\n`, "red");
-    process.exit(1);
-  }
+  return null;
 }
 
-async function handleEdit() {
-  const filePath = args[1];
-  const instruction = args[2];
+// --- Core operations (shared by CLI commands and chat) ---
 
-  if (!filePath || !instruction) {
-    printColored("Please provide a file and instruction.\n", "red");
-    printColored('Usage: free-ai edit <file> "instruction"\n', "dim");
-    process.exit(1);
-  }
-
+async function doEdit(filePath, instruction) {
   const code = readFile(filePath);
-  const lang = getLang(filePath);
+  if (code === null) return;
 
+  const lang = getLang(filePath);
   const prompt = `You are editing the file "${filePath}" (${lang}).
 
 Here is the current content of the file:
@@ -169,7 +144,6 @@ Return ONLY the complete updated file content inside a single code block. Do not
 
     printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
 
-    // Show diff summary
     const oldLines = code.split("\n").length;
     const newLines = newCode.split("\n").length;
     const diff = newLines - oldLines;
@@ -179,7 +153,6 @@ Return ONLY the complete updated file content inside a single code block. Do not
     else if (diff < 0) printColored(` (${diff})`, "red");
     console.log("\n");
 
-    // Show what changed
     const oldSet = new Set(code.split("\n"));
     const newSet = new Set(newCode.split("\n"));
     const added = newCode.split("\n").filter((l) => !oldSet.has(l));
@@ -212,26 +185,18 @@ Return ONLY the complete updated file content inside a single code block. Do not
     }
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
-    process.exit(1);
   }
 }
 
-async function handleExplain() {
-  const filePath = args[1];
-  if (!filePath) {
-    printColored("Please provide a file path.\n", "red");
-    printColored("Usage: free-ai explain <file>\n", "dim");
-    process.exit(1);
-  }
-
+async function doExplain(filePath) {
   const code = readFile(filePath);
-  const lang = getLang(filePath);
+  if (code === null) return;
 
+  const lang = getLang(filePath);
   const prompt = `Explain the following ${lang} code from file "${filePath}". Cover:
 1. What the file does (purpose)
 2. Key functions/methods and what they do
 3. Important patterns or design decisions
-4. Dependencies or connections to other parts of the codebase
 
 Be concise but thorough.
 
@@ -248,21 +213,14 @@ ${code}
     console.log();
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
-    process.exit(1);
   }
 }
 
-async function handleReview() {
-  const filePath = args[1];
-  if (!filePath) {
-    printColored("Please provide a file path.\n", "red");
-    printColored("Usage: free-ai review <file>\n", "dim");
-    process.exit(1);
-  }
-
+async function doReview(filePath) {
   const code = readFile(filePath);
-  const lang = getLang(filePath);
+  if (code === null) return;
 
+  const lang = getLang(filePath);
   const prompt = `Review the following ${lang} code from file "${filePath}". Check for:
 1. Bugs or logic errors
 2. Security vulnerabilities
@@ -284,28 +242,30 @@ ${code}
     console.log();
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
-    process.exit(1);
   }
 }
 
-async function handleGenerate() {
-  const filePath = args[1];
-  const instruction = args[2];
+async function doRead(filePath) {
+  const code = readFile(filePath);
+  if (code === null) return;
 
-  if (!filePath || !instruction) {
-    printColored("Please provide a file path and instruction.\n", "red");
-    printColored('Usage: free-ai generate <file> "instruction"\n', "dim");
-    process.exit(1);
-  }
+  const lang = getLang(filePath);
+  const lines = code.split("\n");
+  printColored(`\n  ${filePath} (${lang}, ${lines.length} lines)\n\n`, "bold");
+  lines.forEach((l, i) => {
+    printColored(`  ${String(i + 1).padStart(4)} `, "dim");
+    console.log(l);
+  });
+  console.log();
+}
 
+async function doGenerate(filePath, instruction) {
   if (existsSync(resolve(filePath))) {
-    printColored(`File already exists: ${filePath}\n`, "red");
-    printColored('Use "free-ai edit" to modify existing files.\n', "dim");
-    process.exit(1);
+    printColored(`File already exists: ${filePath}. Use "edit" instead.\n`, "red");
+    return;
   }
 
   const lang = getLang(filePath);
-
   const prompt = `Generate the content for a new ${lang} file at "${filePath}".
 
 Instruction: ${instruction}
@@ -338,8 +298,231 @@ Return ONLY the file content inside a single code block. No explanations before 
     }
   } catch (err) {
     printColored(`Error: ${err.message}\n`, "red");
+  }
+}
+
+async function doAsk(question, fileContext) {
+  const prompt = fileContext
+    ? `Context:\n\`\`\`\n${fileContext}\n\`\`\`\n\nQuestion: ${question}`
+    : question;
+
+  printColored("⏳ Thinking...\n\n", "dim");
+
+  try {
+    const result = await askAI(prompt, { context: chatHistory });
+    printColored(`[${result.provider} — ${result.model}]\n\n`, "cyan");
+    console.log(result.text);
+    console.log();
+
+    // Add to conversation history
+    chatHistory.push({ role: "user", content: question });
+    chatHistory.push({ role: "assistant", content: result.text });
+
+    // Keep history manageable
+    if (chatHistory.length > 20) {
+      chatHistory = chatHistory.slice(-14);
+    }
+  } catch (err) {
+    printColored(`Error: ${err.message}\n`, "red");
+  }
+}
+
+// --- Conversation history for chat mode ---
+let chatHistory = [];
+
+// --- Interactive Chat Mode ---
+
+async function startChat() {
+  const cwd = process.cwd();
+  const projectName = basename(cwd);
+
+  console.log();
+  printColored("╔══════════════════════════════════════════════╗\n", "cyan");
+  printColored("║        free-ai — AI Coding Agent            ║\n", "cyan");
+  printColored("╚══════════════════════════════════════════════╝\n", "cyan");
+  console.log();
+  printColored(`  Project: ${cwd}\n`, "dim");
+
+  const active = getProviderStatus().filter((p) => p.configured);
+  if (active.length === 0) {
+    printColored("\n  ⚠ No providers configured! Add API keys to .env\n", "yellow");
+    printColored("  Run: free-ai status\n\n", "dim");
     process.exit(1);
   }
+  printColored(`  Providers: ${active.map((p) => p.label).join(", ")}\n`, "dim");
+
+  console.log();
+  printColored("  Type naturally — I can read, edit, review, and generate code.\n", "dim");
+  printColored("  Commands: /status /help /clear /exit\n", "dim");
+  console.log();
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "",
+  });
+
+  function showPrompt() {
+    printColored(`${projectName}`, "green");
+    printColored(` > `, "dim");
+  }
+
+  showPrompt();
+
+  rl.on("line", async (line) => {
+    const input = line.trim();
+    if (!input) {
+      showPrompt();
+      return;
+    }
+
+    // Slash commands
+    if (input === "/exit" || input === "/quit" || input === "/q") {
+      printColored("\n  Goodbye!\n\n", "cyan");
+      process.exit(0);
+    }
+    if (input === "/help") {
+      console.log(HELP);
+      showPrompt();
+      return;
+    }
+    if (input === "/status") {
+      handleStatus();
+      showPrompt();
+      return;
+    }
+    if (input === "/clear") {
+      chatHistory = [];
+      printColored("  Conversation cleared.\n\n", "dim");
+      showPrompt();
+      return;
+    }
+
+    // Parse intent from natural language
+    const lowerInput = input.toLowerCase();
+    const filePath = findFilePath(input);
+
+    // Edit: "edit <file> <instruction>"
+    if (lowerInput.startsWith("edit ") && filePath) {
+      const instruction = input.replace(/^edit\s+/i, "").replace(filePath, "").trim();
+      if (instruction) {
+        await doEdit(filePath, instruction);
+      } else {
+        printColored('  What changes? e.g., edit app/models/user.rb "add email validation"\n\n', "yellow");
+      }
+    }
+    // Review: "review <file>"
+    else if (lowerInput.startsWith("review ") && filePath) {
+      await doReview(filePath);
+    }
+    // Explain: "explain <file>"
+    else if (lowerInput.startsWith("explain ") && filePath) {
+      await doExplain(filePath);
+    }
+    // Read: "read <file>" or "show <file>" or "cat <file>"
+    else if ((lowerInput.startsWith("read ") || lowerInput.startsWith("show ") || lowerInput.startsWith("cat ")) && filePath) {
+      await doRead(filePath);
+    }
+    // Create/Generate: "create <file> <instruction>" or "generate <file> <instruction>"
+    else if ((lowerInput.startsWith("create ") || lowerInput.startsWith("generate ")) && filePath) {
+      const instruction = input.replace(/^(?:create|generate)\s+/i, "").replace(filePath, "").trim();
+      if (instruction) {
+        await doGenerate(filePath, instruction);
+      } else {
+        printColored('  What should the file contain? e.g., create app/models/invoice.rb "model with validations"\n\n', "yellow");
+      }
+    }
+    // If input has a file path + instruction, treat as edit
+    else if (filePath && existsSync(resolve(filePath)) && input.replace(filePath, "").trim().length > 5) {
+      const instruction = input.replace(filePath, "").trim();
+      await doEdit(filePath, instruction);
+    }
+    // Default: ask as a question
+    else {
+      let fileContext = null;
+      // If a file is mentioned, include its content as context
+      if (filePath && existsSync(resolve(filePath))) {
+        fileContext = readFileSync(resolve(filePath), "utf-8");
+      }
+      await doAsk(input, fileContext);
+    }
+
+    showPrompt();
+  });
+
+  rl.on("close", () => {
+    printColored("\n  Goodbye!\n\n", "cyan");
+    process.exit(0);
+  });
+}
+
+// --- One-shot CLI command handlers (call shared functions) ---
+
+async function handleAsk() {
+  let fileContent = null;
+  let question = null;
+  const askArgs = args.slice(1);
+
+  for (let i = 0; i < askArgs.length; i++) {
+    if (askArgs[i] === "-f" && askArgs[i + 1]) {
+      const f = readFile(askArgs[i + 1]);
+      if (f === null) process.exit(1);
+      fileContent = f;
+      i++;
+    } else {
+      question = askArgs[i];
+    }
+  }
+
+  if (!question) {
+    printColored("Please provide a question.\n", "red");
+    printColored('Usage: free-ai ask "your question"\n', "dim");
+    process.exit(1);
+  }
+
+  await doAsk(question, fileContent);
+}
+
+async function handleEdit() {
+  const filePath = args[1];
+  const instruction = args[2];
+  if (!filePath || !instruction) {
+    printColored("Please provide a file and instruction.\n", "red");
+    printColored('Usage: free-ai edit <file> "instruction"\n', "dim");
+    process.exit(1);
+  }
+  await doEdit(filePath, instruction);
+}
+
+async function handleExplain() {
+  const filePath = args[1];
+  if (!filePath) {
+    printColored("Please provide a file path.\n", "red");
+    printColored("Usage: free-ai explain <file>\n", "dim");
+    process.exit(1);
+  }
+  await doExplain(filePath);
+}
+
+async function handleReview() {
+  const filePath = args[1];
+  if (!filePath) {
+    printColored("Please provide a file path.\n", "red");
+    printColored("Usage: free-ai review <file>\n", "dim");
+    process.exit(1);
+  }
+  await doReview(filePath);
+}
+
+async function handleGenerate() {
+  const filePath = args[1];
+  const instruction = args[2];
+  if (!filePath || !instruction) {
+    printColored("Please provide a file path and instruction.\n", "red");
+    printColored('Usage: free-ai generate <file> "instruction"\n', "dim");
+    process.exit(1);
+  }
+  await doGenerate(filePath, instruction);
 }
 
 function handleStatus() {
@@ -369,7 +552,13 @@ function handleStatus() {
   }
 }
 
+// --- Main ---
+
 switch (command) {
+  case "chat":
+  case undefined:
+    await startChat();
+    break;
   case "ask":
     await handleAsk();
     break;
@@ -391,7 +580,6 @@ switch (command) {
   case "help":
   case "--help":
   case "-h":
-  case undefined:
     console.log(HELP);
     break;
   default:
