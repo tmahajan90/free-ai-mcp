@@ -1,0 +1,16 @@
+{
+  "name": "free-ai-mcp",
+  "version": "1.0.0",
+  "description": "MCP server + CLI that chains free AI APIs with automatic fallback",
+  "type": "module",
+  "bin": {
+    "free-ai": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/mcp-server.js",
+    "cli": "node src/cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
