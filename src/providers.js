@@ -3,7 +3,7 @@ const PROVIDERS = [
     name: "gemini",
     label: "Google Gemini",
     envKey: "GEMINI_API_KEY",
-    model: "gemini-2.0-flash",
+    model: "gemini-2.5-flash",
     endpoint: "https://generativelanguage.googleapis.com/v1beta/models",
     freeInfo: "15 req/min, 1M tokens/day — https://aistudio.google.com/apikey",
 
@@ -101,9 +101,9 @@ const PROVIDERS = [
 
   {
     name: "cerebras",
-    label: "Cerebras (Llama)",
+    label: "Cerebras",
     envKey: "CEREBRAS_API_KEY",
-    model: "llama-4-scout-17b-16e-instruct",
+    model: "qwen-3.8-27b",
     endpoint: "https://api.cerebras.ai/v1/chat/completions",
     freeInfo: "Free tier — https://cloud.cerebras.ai",
 
@@ -135,7 +135,7 @@ const PROVIDERS = [
     name: "openrouter",
     label: "OpenRouter (Free models)",
     envKey: "OPENROUTER_API_KEY",
-    model: "deepseek/deepseek-chat-v3-0324:free",
+    model: "nex-agi/nex-n2.5-pro:free",
     endpoint: "https://openrouter.ai/api/v1/chat/completions",
     freeInfo: "Free models available — https://openrouter.ai",
 

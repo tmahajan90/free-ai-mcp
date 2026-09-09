@@ -8,11 +8,11 @@ Works as both a **CLI tool** (use directly in terminal) and an **MCP server** (u
 
 | Provider | Model | Free Tier | Sign Up |
 |---|---|---|---|
-| Google Gemini | gemini-2.0-flash | 15 req/min, 1M tokens/day | https://aistudio.google.com/apikey |
+| Google Gemini | gemini-2.5-flash | 15 req/min, 1M tokens/day | https://aistudio.google.com/apikey |
 | Groq | llama-3.3-70b | 30 req/min, 14,400 req/day | https://console.groq.com |
 | Mistral AI | mistral-small | Free tier | https://console.mistral.ai |
-| Cerebras | llama-4-scout | Free tier | https://cloud.cerebras.ai |
-| OpenRouter | deepseek-v3 (free) | Free models available | https://openrouter.ai/keys |
+| Cerebras | qwen-3.8-27b | Free tier | https://cloud.cerebras.ai |
+| OpenRouter | nex-n2.5-pro (free) | Free models available | https://openrouter.ai/keys |
 
 ## Setup
 
